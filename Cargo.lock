@@ -818,6 +818,7 @@ version = "0.1.0"
 dependencies = [
  "arbitrary",
  "derive_arbitrary",
+ "ed25519-dalek",
  "soroban-sdk",
 ]
 
@@ -825,6 +826,7 @@ dependencies = [
 name = "payment_proxy"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
  "soroban-sdk",
 ]
 
@@ -1524,6 +1526,15 @@ dependencies = [
 name = "timelock_escrow"
 version = "0.1.0"
 dependencies = [
+ "soroban-sdk",
+]
+
+[[package]]
+name = "twap_oracle"
+version = "0.1.0"
+dependencies = [
+ "arbitrary",
+ "derive_arbitrary",
  "soroban-sdk",
 ]
 

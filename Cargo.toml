@@ -12,6 +12,11 @@ members = [
     "pausable_token",
     "payment_proxy",
     "timelock_escrow",
+    "twap_oracle",
+]
+exclude = [
+    "payment_router/fuzz",
+    "yield_escrow"
 ]
 
 # Edition 2021 members require resolver v2.

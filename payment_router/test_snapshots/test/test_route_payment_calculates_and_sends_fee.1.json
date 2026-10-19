@@ -332,7 +332,7 @@
             "key": {
               "vec": [
                 {
-                  "symbol": "UserRecord"
+                  "symbol": "RateLimitCounter"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
@@ -352,7 +352,7 @@
                 "key": {
                   "vec": [
                     {
-                      "symbol": "UserRecord"
+                      "symbol": "RateLimitCounter"
                     },
                     {
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
@@ -361,7 +361,7 @@
                 },
                 "durability": "persistent",
                 "val": {
-                  "bytes": "00000000000000000000000000000000000000000000271000000000000000000000000000002710"
+                  "bytes": "0000000000000002"
                 }
               }
             },
@@ -709,6 +709,18 @@
                         "key": {
                           "vec": [
                             {
+                              "symbol": "ReentrancyGuard"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "bool": false
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
                               "symbol": "Role"
                             },
                             {
@@ -758,6 +770,21 @@
                             },
                             {
                               "u32": 4
+                            }
+                          ]
+                        },
+                        "val": {
+                          "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "Role"
+                            },
+                            {
+                              "u32": 5
                             }
                           ]
                         },

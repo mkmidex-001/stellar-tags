@@ -1,535 +1,27 @@
 #![no_std]
+pub mod access;
 mod archival;
+pub mod errors;
+pub mod fees;
+pub mod rate_limit;
+pub mod storage;
+pub mod timelock;
+pub mod types;
+
+pub use access::*;
 use archival::{ArchiveLeaf, ArchiveMetadata, ArchiveRecordType};
+pub use errors::*;
+pub use fees::*;
+pub use rate_limit::*;
+pub use storage::*;
+pub use timelock::*;
+pub use types::*;
+
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
-    contract, contractclient, contracterror, contractimpl, contracttype, log, symbol_short, token,
-    vec, Address, Bytes, BytesN, Env, Error as SdkError, IntoVal, InvokeError, String, Symbol, Vec,
+    contract, contractimpl, log, symbol_short, token, vec, Address, Bytes, BytesN, Env,
+    Error as SdkError, IntoVal, InvokeError, String, Symbol, Vec,
 };
-
-// ── Packed UserRecord helpers ───────────────────────────────────────────────
-//
-// Issue #519: replace the two-field `UserSpending` contracttype with a single
-// packed value instead of a struct, dropping the XDR type discriminant and
-// field tags Soroban adds to every contracttype.
-//
-// Issue #663: merge the per-user `UserSpending` and `UserVolume` entries into
-// one packed `UserRecord`. A sender's first routed payment used to write two
-// persistent entries — two reads, two writes, two TTL extensions, two XDR
-// envelopes — and it now performs exactly one of each.
-//
-// Layout (big-endian):
-//   bytes  0..8  — last_reset_time    : u64  (8 bytes)
-//   bytes  8..24 — accumulated_amount : i128 (16 bytes)
-//   bytes 24..40 — lifetime volume    : i128 (16 bytes)
-//
-// Backward compatibility: the legacy `UserSpending` / `UserVolume` keys are no
-// longer written. `load_user_record` still reads them and combines them on the
-// next write, and the permissionless `migrate_user_record` entry point cleans
-// up any account that has not paid since the upgrade.
-
-/// Pack `last_reset_time` (u64), `accumulated_amount` (i128) and `volume`
-/// (i128) into a 40-byte big-endian buffer.
-fn pack_user_record(
-    env: &Env,
-    last_reset_time: u64,
-    accumulated_amount: i128,
-    volume: i128,
-) -> BytesN<40> {
-    let mut buf = [0u8; 40];
-
-    buf[..8].copy_from_slice(&last_reset_time.to_be_bytes());
-    buf[8..24].copy_from_slice(&accumulated_amount.to_be_bytes());
-    buf[24..40].copy_from_slice(&volume.to_be_bytes());
-
-    BytesN::from_array(env, &buf)
-}
-
-/// Unpack a 40-byte buffer into `(last_reset_time, accumulated_amount, volume)`.
-fn unpack_user_record(packed: &BytesN<40>) -> (u64, i128, i128) {
-    let buf: [u8; 40] = packed.to_array();
-
-    let last_reset_time = u64::from_be_bytes([
-        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-    ]);
-
-    let accumulated_amount = i128::from_be_bytes([
-        buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15], buf[16], buf[17],
-        buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
-    ]);
-
-    let volume = i128::from_be_bytes([
-        buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31], buf[32], buf[33],
-        buf[34], buf[35], buf[36], buf[37], buf[38], buf[39],
-    ]);
-
-    (last_reset_time, accumulated_amount, volume)
-}
-
-/// Unpack a legacy 24-byte `UserSpending` buffer into
-/// `(last_reset_time, accumulated_amount)`.
-///
-/// Kept so the migration fallback in `load_user_record` can still read
-/// pre-#663 ledger state.
-fn unpack_legacy_spending(packed: &BytesN<24>) -> (u64, i128) {
-    let buf: [u8; 24] = packed.to_array();
-
-    let last_reset_time = u64::from_be_bytes([
-        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-    ]);
-
-    let accumulated_amount = i128::from_be_bytes([
-        buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15], buf[16], buf[17],
-        buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
-    ]);
-
-    (last_reset_time, accumulated_amount)
-}
-
-// ── Legacy struct kept for test snapshot compatibility ───────────────────────
-//
-// The UserSpending contracttype is retained so existing tests that reference
-// it directly continue to compile. All runtime code now uses the packed
-// `BytesN<40>` representation stored under DataKey::UserRecord.
-
-/// A user's rolling 24-hour spending record.
-///
-/// Retained purely so existing test snapshots that reference this type by
-/// name keep compiling. Pre-#663 live contract state was stored as a packed
-/// `BytesN<24>` (still readable via `unpack_legacy_spending`); this struct is
-/// not read from or written to storage at runtime.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct UserSpending {
-    /// Unix timestamp (seconds) at which the 24-hour window last reset.
-    pub last_reset_time: u64,
-    /// Total amount routed by the user since `last_reset_time`.
-    pub accumulated_amount: i128,
-}
-
-/// A user's combined routing stats, unpacked from the packed `BytesN<40>`
-/// `UserRecord` ledger value (issue #663).
-///
-/// Returned by [`PaymentRouter::get_user_record`] so a client can read both
-/// counters in a single view call instead of two.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct UserRecord {
-    /// Total amount routed by the user in the current 24-hour window.
-    pub accumulated_amount: i128,
-    /// Cumulative lifetime amount routed by the user.
-    pub volume: i128,
-    /// Unix timestamp (seconds) at which the 24-hour window last reset.
-    pub last_reset_time: u64,
-}
-
-/// A single transfer instruction for use with [`PaymentRouter::route_payments`].
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Payment {
-    /// Address the funds are debited from. Must authorize the call.
-    pub sender: Address,
-    /// Address the funds (minus the platform fee) are credited to.
-    pub recipient: Address,
-    /// Contract ID of the token (or Stellar Asset Contract) being transferred.
-    pub token_address: Address,
-    /// Amount to route, denominated in the token's smallest unit. Must be
-    /// positive and within the contract's configured min/max bounds.
-    pub amount: i128,
-}
-
-/// Structured payload for meta-transactions.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MetaPayment {
-    pub nonce: u64,
-    pub deadline: u64,
-    pub sender: Address,
-    pub recipient: Address,
-    pub token_address: Address,
-    pub amount: i128,
-}
-
-// ── Token swap types ─────────────────────────────────────────────────────────
-//
-// Issue #665: allow a sender to pay in an arbitrary token and have it swapped
-// into the merchant's preferred token during payment routing.  The swap is a
-// cross-contract call into a DEX router, executed inside the same Soroban
-// transaction as the transfer so the payment either completes end to end or
-// leaves no trace at all.
-
-/// A single swap-routed transfer instruction for use with
-/// [`PaymentRouter::route_payment_with_swap`] and
-/// [`PaymentRouter::route_payments_with_swap`].
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SwapPayment {
-    /// Address the funds are debited from. Must authorize the call.
-    pub sender: Address,
-    /// Address the swapped funds (minus the platform fee) are credited to.
-    pub recipient: Address,
-    /// Token the sender pays with, in that token's smallest unit.
-    pub sell_token: Address,
-    /// Token the recipient is paid in. Must differ from `sell_token`.
-    pub buy_token: Address,
-    /// Amount of `sell_token` to pull from the sender and swap.
-    pub amount_in: i128,
-    /// Minimum amount of `buy_token` the swap must deliver. This is the
-    /// slippage floor: if the DEX returns less, the whole payment reverts.
-    pub min_amount_out: i128,
-    /// Amount of `buy_token` the caller expected from a prior `quote_swap`
-    /// call. `0` disables the ceiling check; otherwise the realised output
-    /// must stay within the contract's `max_slippage_bps` of this figure.
-    pub expected_amount_out: i128,
-    /// Unix timestamp (seconds) after which the swap must not execute. `0`
-    /// disables the deadline, letting the DEX apply its own.
-    pub deadline: u64,
-    /// Contract ID of the DEX adapter to invoke. Must be registered by the
-    /// admin, which keeps the cross-contract call pointed at audited code.
-    pub dex: Address,
-}
-
-/// The result of a DEX quote, returned by [`PaymentRouter::quote_swap`].
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SwapQuote {
-    /// Amount of `buy_token` the DEX expects to deliver for the quoted input.
-    pub amount_out: i128,
-    /// Tightest `min_amount_out` that still respects the contract's
-    /// `max_slippage_bps` for this quote.
-    pub min_amount_out: i128,
-    /// Configured maximum slippage, in basis points, that produced
-    /// `min_amount_out`.
-    pub max_slippage_bps: i128,
-}
-
-/// Adapter interface implemented by the DEX used for an arbitrary token swap.
-/// The router transfers the input asset to the adapter. The result must contain
-/// `[amount_received, unused_input]`; the adapter must send the output asset to
-/// `recipient` and return any unused input to the router.
-#[contractclient(name = "DexRouterClient")]
-pub trait DexRouter {
-    fn swap_exact_tokens_for_tokens(
-        env: Env,
-        token_in: Address,
-        token_out: Address,
-        amount_in: i128,
-        min_amount_out: i128,
-        path: Vec<Address>,
-        recipient: Address,
-    ) -> Vec<i128>;
-}
-
-// ── Timelock data structures ─────────────────────────────────────────────────
-//
-// Admin actions that change sensitive contract parameters (treasury, fees,
-// governance, admin transfer) are not applied instantly.  Instead the admin
-// queues an ActionType intent that gets a nonce ID and a ledger timestamp.
-// Only after SECONDS_IN_24H (86 400 s) has elapsed can execute_action be
-// called to apply the change.  This gives observers a 24-hour window to
-// detect and respond to a compromised-admin scenario.
-//
-// The freeze mechanism is the complementary emergency tool: calling
-// emergency_freeze instantly blocks all payments and all timelock executions.
-// A freeze does NOT require going through the timelock itself so it is always
-// available to the admin as an immediate last resort.  Unfreezing likewise
-// takes effect immediately so the admin can restore service once the threat is
-// resolved.
-
-/// Describes which administrative parameter change a timelock entry represents.
-/// Each variant carries all the arguments needed to apply that change when the
-/// delay period is over.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ActionType {
-    /// Change the platform treasury address.
-    SetPlatformTreasury(Address),
-    /// Update fee basis-points and fee cap together (legacy / combined setter).
-    SetFeeConfig(i128, i128),
-    /// Update fee basis-points only.
-    SetFeeBps(i128),
-    /// Set the governance contract address.
-    SetGovernance(Address),
-    /// Change the minimum routing limit.
-    SetMinLimit(i128),
-    /// Transfer admin rights to a new address.
-    TransferAdmin(Address),
-    /// Upgrade the contract WASM.
-    Upgrade(BytesN<32>),
-    /// Allow swap routing to invoke a DEX router contract.
-    RegisterDex(Address),
-    /// Stop swap routing from invoking a DEX router contract.
-    DeregisterDex(Address),
-    /// Update the maximum tolerated swap slippage.
-    SetMaxSlippageBps(i128),
-}
-
-/// A pending timelock entry stored in persistent ledger storage.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TimelockEntry {
-    /// Ledger timestamp (seconds since epoch) when this action was queued.
-    pub queued_at: u64,
-    /// The action payload to apply once the delay has elapsed.
-    pub action: ActionType,
-}
-
-/// Role definitions for the Role-Based Access Control (RBAC) system.
-///
-/// Segregates operational privileges across dedicated role boundaries:
-/// SuperAdmin, TreasuryManager, ComplianceOfficer, FeeManager.
-#[contracttype]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-#[repr(u32)]
-pub enum Role {
-    /// Supreme administrator with exclusive authority over role assignments,
-    /// contract upgrades, emergency freeze/unfreeze, and root governance.
-    SuperAdmin = 1,
-    /// Manager with exclusive authority over platform treasury, yield operations,
-    /// token recovery, and emergency asset withdrawals.
-    TreasuryManager = 2,
-    /// Compliance officer with authority over address blacklisting, KYC oracle
-    /// configurations, and emergency operational pause switches.
-    ComplianceOfficer = 3,
-    /// Fee manager with authority over platform fee basis points, fee caps, and
-    /// minimum payment limits.
-    FeeManager = 4,
-}
-
-/// Interface implemented by supported Soroban lending protocols.
-///
-/// Keeping the protocol behind this small adapter lets the router integrate
-/// with Blend-compatible deployments while tests use an in-process mock.
-#[contractclient(name = "LendingProtocolClient")]
-pub trait LendingProtocol {
-    fn deposit(env: Env, from: Address, token: Address, amount: i128);
-    fn withdraw(env: Env, to: Address, token: Address, amount: i128);
-    fn harvest(env: Env, to: Address, token: Address) -> i128;
-}
-
-/// Minimal interface for an admin-selected KYC issuer or oracle contract.
-#[contractclient(name = "KycOracleClient")]
-pub trait KycOracle {
-    fn is_verified(env: Env, account: Address) -> bool;
-}
-
-/// Interface implemented by the admin-selected price-feed oracle.
-///
-/// Implementations must return a price quote with a `timestamp` (Unix seconds)
-/// so staleness can be checked against the contract's configured threshold.
-/// The `price` is expressed as a fixed-point integer with the number of
-/// decimal places indicated by `decimals`.  For example, a USD/XLM price of
-/// 0.12500000 with `decimals = 8` would be returned as `price = 12500000`.
-///
-/// Keeping the protocol behind this thin adapter lets the router integrate
-/// with any Soroban-compatible price oracle while tests use an in-process mock.
-#[contractclient(name = "PriceFeedOracleClient")]
-pub trait PriceFeedOracle {
-    /// Returns the latest price of `base_asset` denominated in `quote_asset`.
-    ///
-    /// # Returns
-    /// A `PriceData` struct containing `price`, `decimals`, and `timestamp`.
-    fn get_price(env: Env, base_asset: Address, quote_asset: Address) -> PriceData;
-}
-
-/// A single price quote returned by the oracle.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PriceData {
-    /// Fixed-point price value. The true price is `price / 10^decimals`.
-    pub price: i128,
-    /// Number of decimal places used in `price`.
-    pub decimals: u32,
-    /// Unix timestamp (seconds) when this price was last updated on-chain.
-    pub timestamp: u64,
-}
-
-/// A fee change proposal weighted by governance-token balances.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FeeProposal {
-    pub proposer: Address,
-    pub fee_bps: i128,
-    pub fee_cap: i128,
-    pub created_at: u64,
-    pub voting_ends_at: u64,
-    pub yes_votes: i128,
-    pub no_votes: i128,
-    pub quorum: i128,
-    pub executed: bool,
-}
-
-/// Storage keys for all contract instance and persistent data.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum DataKey {
-    /// The current admin address.
-    Admin,
-    /// Governance contract address; if set, it takes over fee-authority from the admin.
-    Governance,
-    /// Address that receives collected platform fees.
-    PlatformTreasury,
-    /// Platform fee rate, in basis points (1/100th of a percent).
-    FeeBps,
-    /// Upper bound on the fee taken from a single payment.
-    FeeCap,
-    /// Minimum amount accepted by `route_payment` / `route_payments`, if set.
-    MinLimit,
-    /// Whether routing is currently paused.
-    Paused,
-    /// Maximum amount accepted by a single payment.
-    MaxAmount,
-    /// Cumulative lifetime amount routed by a given sender.
-    /// Packed per-user record (issue #663): the 24-hour spending window plus
-    /// the cumulative lifetime volume, stored as a single 40-byte value so
-    /// registering a sender costs one ledger entry instead of two.
-    UserRecord(Address),
-    /// DEPRECATED (pre-#663): packed 24-hour spending window for a sender.
-    /// No longer written; read only by the `load_user_record` fallback and by
-    /// `migrate_user_record`.
-    UserSpending(Address),
-    /// DEPRECATED (pre-#663): cumulative lifetime amount routed by a sender.
-    /// No longer written; read only by the `load_user_record` fallback and by
-    /// `migrate_user_record`.
-    UserVolume(Address),
-    /// Whether a given recipient address is blacklisted.
-    Blacklist(Address),
-    /// Internal refund balance for a (user, token) pair, credited when a
-    /// direct transfer to the recipient fails.
-    RefundBalance(Address, Address),
-    /// Monotonically-increasing nonce counter used to generate unique IDs for
-    /// timelock entries.  Stored as `u64` in instance storage.
-    TimelockNonce,
-    /// A pending timelock entry keyed by its nonce ID.
-    /// Stored in persistent storage so it survives instance eviction.
-    TimelockEntry(u64),
-    /// When `true` the contract is frozen: payments and timelock executions
-    /// are blocked.  Stored as `bool` in instance storage.
-    Frozen,
-    /// Whether an address holds a given role.
-    UserRole(Address, Role),
-    /// The primary address currently holding a role.
-    Role(Role),
-    /// Monotonic nonce for meta-transaction replay protection.
-    MetaNonce(Address),
-    /// Trusted issuer/oracle queried for high-value payment senders.
-    KycOracle,
-    /// Payments strictly above this amount require a valid KYC claim.
-    KycThreshold,
-    /// Address of the price-feed oracle used for fiat/crypto lookups.
-    OracleAddress,
-    /// Maximum acceptable age, in seconds, of an oracle price quote.
-    StalenessThreshold,
-    /// Admin-supplied fallback price for a (base, quote) asset pair.
-    FallbackPrice(Address, Address),
-    /// Token whose balances weight fee-governance votes.
-    GovernanceToken,
-    /// Minimum weighted vote share required to pass a fee proposal.
-    GovernanceQuorum,
-    /// Monotonic nonce for fee-proposal ids.
-    GovernanceNonce,
-    /// A pending fee-change proposal keyed by its id.
-    GovernanceProposal(u64),
-    /// Recorded yes/no vote weight for a fee proposal.
-    GovernanceVote(u64, Address),
-    /// Current archival epoch counter, stored in instance storage.
-    ArchiveEpoch,
-    /// Merkle root committed for an archival epoch.
-    ArchiveRoot(u64),
-    /// Metadata committed alongside an archival root.
-    ArchiveMeta(u64),
-    /// Lending protocol contract used for treasury yield operations.
-    YieldProtocol,
-    /// Principal currently deposited into the yield protocol per token.
-    YieldPrincipal(Address),
-    /// Whether a DEX router contract is approved to receive cross-contract
-    /// swap calls.  Stored as `bool` in persistent storage.
-    RegisteredDex(Address),
-    /// Maximum tolerated swap slippage in basis points, applied against a
-    /// caller-supplied quote.  Stored as `i128` in instance storage.
-    MaxSlippageBps,
-}
-
-/// Contract-level errors returned instead of panicking, so callers get a
-/// specific, stable error code to branch on rather than an opaque trap.
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-#[repr(u32)]
-pub enum Error {
-    /// Caller is not authorized to perform this action (e.g. not the admin).
-    Unauthorized = 1,
-    /// Sender's token balance is lower than the requested payment amount.
-    InsufficientBalance = 2,
-    /// Requested amount is outside allowed bounds, or a spending limit was exceeded.
-    LimitExceeded = 3,
-    /// `initialize` was called on a contract that already has an admin set.
-    AlreadyInitialized = 4,
-    /// An admin-configured value (treasury, fee, admin) was read before `initialize`.
-    NotInitialized = 5,
-    /// The contract is currently paused; routing calls are rejected until unpaused.
-    Paused = 6,
-    /// A fee configuration value (basis points or cap) is out of the allowed range.
-    InvalidFeeRate = 7,
-    /// Sender and recipient addresses are the same (self-routing not allowed).
-    InvalidRecipient = 8,
-    /// Recipient address is blacklisted.
-    Blacklisted = 9,
-    /// Requested refund withdrawal amount is zero or exceeds available refund balance.
-    NoRefundAvailable = 10,
-    /// An action is already pending in the timelock queue; it must be executed
-    /// or cancelled before a duplicate can be queued (not currently enforced,
-    /// but reserved for future deduplication logic).
-    TimelockPending = 11,
-    /// The 24-hour delay for the given timelock entry has not elapsed yet.
-    TimelockNotReady = 12,
-    /// No timelock entry exists for the supplied nonce ID.
-    TimelockNotFound = 13,
-    /// The contract is frozen; all payments and timelock executions are blocked.
-    ContractFrozen = 14,
-    /// The swap named a DEX router that the admin has not registered.
-    DexNotRegistered = 15,
-    /// The DEX cross-contract call reverted or returned an unusable value.
-    SwapFailed = 16,
-    /// The swap delivered less than `min_amount_out`, or moved the output
-    /// further than `max_slippage_bps` away from the caller's quote.
-    SlippageExceeded = 17,
-    /// The swap was submitted after its `deadline` had already passed.
-    SwapDeadlineExpired = 18,
-    /// The supplied role is not one the contract recognises.
-    InvalidRole = 20,
-    /// A governance proposal id is unknown or no longer votable.
-    InvalidProposal = 21,
-    /// A governance operation was attempted before governance was configured.
-    GovernanceNotConfigured = 22,
-    /// The caller has already voted on this proposal.
-    AlreadyVoted = 23,
-    /// The configured KYC threshold is negative.
-    InvalidKycThreshold = 24,
-    /// A yield operation was attempted before the yield protocol was configured.
-    YieldProtocolNotConfigured = 25,
-    /// The yield amount is not positive or exceeds the available principal.
-    InvalidYieldAmount = 26,
-    /// No price-feed oracle is configured for this contract.
-    OracleNotConfigured = 27,
-    /// The oracle cross-contract call reverted or returned an unusable value.
-    OracleCallFailed = 28,
-    /// The oracle quote is older than the configured staleness threshold.
-    OraclePriceStale = 29,
-    /// The oracle quote is not a usable price (zero or negative).
-    OraclePriceInvalid = 30,
-    /// A meta-transaction was submitted after its `deadline` had passed.
-    DeadlineExpired = 31,
-    /// The meta-transaction nonce does not match the sender's stored nonce.
-    InvalidNonce = 32,
-    /// The meta-transaction signature did not verify against the payload.
-    InvalidSignature = 33,
-    /// Swap parameters are self-contradictory or unusable (for example
-    /// `sell_token == buy_token`, or a non-positive `min_amount_out`).
-    InvalidSwapParams = 19,
-    /// A payment above the configured KYC threshold was made by a sender the
-    /// configured oracle does not recognise.
-    KycRequired = 34,
-}
 
 /// Soroban contract that routes token payments between addresses while
 /// collecting a configurable platform fee, enforcing per-user daily spending
@@ -539,119 +31,169 @@ pub struct PaymentRouter;
 
 #[contractimpl]
 impl PaymentRouter {
-    const BPS_DIVISOR: i128 = 10_000;
-    const XLM_DECIMALS: i128 = 10_000_000;
-    const MAX_AMOUNT: i128 = 1_000_000_000_000_000; // 100M tokens with 7 decimals
-    const DAILY_MAX_LIMIT: i128 = 1_000_000 * Self::XLM_DECIMALS; // 1M tokens limit
-    const VOLUME_THRESHOLD: i128 = 10_000 * Self::XLM_DECIMALS; // 10,000 XLM threshold for tiered fee discount
-    const SECONDS_IN_24H: u64 = 24 * 3600;
-    const VERSION: u32 = 1;
+    pub const BPS_DIVISOR: i128 = storage::BPS_DIVISOR;
+    pub const XLM_DECIMALS: i128 = storage::XLM_DECIMALS;
+    pub const MAX_AMOUNT: i128 = storage::MAX_AMOUNT;
+    pub const DAILY_MAX_LIMIT: i128 = storage::DAILY_MAX_LIMIT;
+    pub const VOLUME_THRESHOLD: i128 = storage::VOLUME_THRESHOLD;
+    pub const SECONDS_IN_24H: u64 = storage::SECONDS_IN_24H;
+    pub const MIN_DMS_TIMEOUT: u64 = storage::MIN_DMS_TIMEOUT;
+    pub const DEFAULT_RATE_LIMIT: u32 = storage::DEFAULT_RATE_LIMIT;
+    pub const MAX_RATE_LIMIT: u32 = storage::MAX_RATE_LIMIT;
+    pub const CONTRACT_VERSION: &'static str = env!("CARGO_PKG_VERSION");
+    pub const DEFAULT_MAX_SLIPPAGE_BPS: i128 = storage::DEFAULT_MAX_SLIPPAGE_BPS;
+    pub const MAX_SLIPPAGE_BPS_LIMIT: i128 = storage::MAX_SLIPPAGE_BPS_LIMIT;
+    pub const MAX_PAIR_SLIPPAGE_BPS: i128 = storage::MAX_PAIR_SLIPPAGE_BPS;
+    pub const DAY_IN_LEDGERS: u32 = storage::DAY_IN_LEDGERS;
+    pub const INSTANCE_BUMP_AMOUNT: u32 = storage::INSTANCE_BUMP_AMOUNT;
+    pub const INSTANCE_LIFETIME_THRESHOLD: u32 = storage::INSTANCE_LIFETIME_THRESHOLD;
+    pub const USER_BUMP_AMOUNT: u32 = storage::USER_BUMP_AMOUNT;
+    pub const USER_LIFETIME_THRESHOLD: u32 = storage::USER_LIFETIME_THRESHOLD;
+    pub const PERSISTENT_BUMP_AMOUNT: u32 = storage::PERSISTENT_BUMP_AMOUNT;
+    pub const PERSISTENT_LIFETIME_THRESHOLD: u32 = storage::PERSISTENT_LIFETIME_THRESHOLD;
 
-    /// Default ceiling on how far a swap may move against the caller's quote:
-    /// 1 000 bps = 10%.  Applied only when the caller supplies an
-    /// `expected_amount_out`; the `min_amount_out` floor always applies.
-    const DEFAULT_MAX_SLIPPAGE_BPS: i128 = 1_000;
-    /// Absolute ceiling for the configurable slippage setting (100%).
-    const MAX_SLIPPAGE_BPS_LIMIT: i128 = 10_000;
+    // ── Delegated Domain Helpers ─────────────────────────────────────────────
 
-    const DAY_IN_LEDGERS: u32 = 17280;
-    const INSTANCE_BUMP_AMOUNT: u32 = 7 * Self::DAY_IN_LEDGERS;
-    const INSTANCE_LIFETIME_THRESHOLD: u32 = Self::INSTANCE_BUMP_AMOUNT - Self::DAY_IN_LEDGERS;
-
-    const USER_BUMP_AMOUNT: u32 = 30 * Self::DAY_IN_LEDGERS;
-    const USER_LIFETIME_THRESHOLD: u32 = Self::USER_BUMP_AMOUNT - Self::DAY_IN_LEDGERS;
-    const PERSISTENT_BUMP_AMOUNT: u32 = Self::USER_BUMP_AMOUNT;
-    const PERSISTENT_LIFETIME_THRESHOLD: u32 = Self::USER_LIFETIME_THRESHOLD;
-
-    // ── Private helpers ──────────────────────────────────────────────────────
-
+    #[inline]
     fn set_role_internal(env: &Env, role: Role, account: &Address) {
-        env.storage().instance().set(&DataKey::Role(role), account);
-        env.storage()
-            .persistent()
-            .set(&DataKey::UserRole(account.clone(), role), &true);
-        env.storage().persistent().extend_ttl(
-            &DataKey::UserRole(account.clone(), role),
-            Self::PERSISTENT_LIFETIME_THRESHOLD,
-            Self::PERSISTENT_BUMP_AMOUNT,
-        );
+        access::set_role_internal(env, role, account);
     }
-
+    #[inline]
     fn remove_role_internal(env: &Env, role: Role, account: &Address) {
-        if let Some(current) = env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::Role(role))
-        {
-            if current == *account {
-                env.storage().instance().remove(&DataKey::Role(role));
-            }
-        }
-        env.storage()
-            .persistent()
-            .set(&DataKey::UserRole(account.clone(), role), &false);
+        access::remove_role_internal(env, role, account);
     }
-
+    #[inline]
+    fn apply_role_grant(env: &Env, grantee: &Address, role: Role) {
+        access::apply_role_grant(env, grantee, role);
+    }
+    #[inline]
+    fn apply_role_revoke(env: &Env, grantee: &Address, role: Role) {
+        access::apply_role_revoke(env, grantee, role);
+    }
+    #[inline]
     fn require_role(env: &Env, role: Role) -> Result<Address, Error> {
-        let addr = if let Some(role_addr) = env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::Role(role))
-        {
-            role_addr
-        } else {
-            Self::require_admin(env)?
-        };
-        addr.require_auth();
-        Ok(addr)
+        access::require_role(env, role)
     }
-
+    #[inline]
     fn require_admin(env: &Env) -> Result<Address, Error> {
-        env.storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)
+        access::require_admin(env)
     }
-
-    /// Fee authority helper: if a Governance address is set it takes exclusive
-    /// control over fee updates; otherwise the FeeManager retains that right.
+    #[inline]
+    fn has_role_internal(env: &Env, account: &Address, role: Role) -> bool {
+        access::has_role_internal(env, account, role)
+    }
+    #[inline]
+    fn require_role_of(env: &Env, caller: &Address, role: Role) -> Result<(), Error> {
+        access::require_role_of(env, caller, role)
+    }
+    #[inline]
     fn require_fee_authority(env: &Env) -> Result<(), Error> {
-        if let Some(gov) = env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::Governance)
-        {
-            gov.require_auth();
-            Ok(())
-        } else {
-            Self::require_role(env, Role::FeeManager)?;
-            Ok(())
+        access::require_fee_authority(env)
+    }
+    #[inline]
+    fn load_multisig_config(env: &Env) -> Result<(Vec<Address>, u32), Error> {
+        access::load_multisig_config(env)
+    }
+    #[inline]
+    fn validate_multisig_config(signers: &Vec<Address>, threshold: u32) -> Result<u32, Error> {
+        access::validate_multisig_config(signers, threshold)
+    }
+    #[inline]
+    fn load_effective_approvals(
+        env: &Env,
+        signers: &Vec<Address>,
+        new_wasm_hash: &BytesN<32>,
+    ) -> Vec<Address> {
+        access::load_effective_approvals(env, signers, new_wasm_hash)
+    }
+    #[inline]
+    fn check_upgrade_authorized(env: &Env, new_wasm_hash: &BytesN<32>) -> Result<bool, Error> {
+        access::check_upgrade_authorized(env, new_wasm_hash)
+    }
+    #[inline]
+    fn require_upgrade_authorized(env: &Env, new_wasm_hash: &BytesN<32>) -> Result<u32, Error> {
+        access::require_upgrade_authorized(env, new_wasm_hash)
+    }
+    #[inline]
+    fn apply_upgrade(env: &Env, new_wasm_hash: &BytesN<32>) {
+        access::apply_upgrade(env, new_wasm_hash);
+    }
+    #[inline]
+    fn store_multisig_config(env: &Env, signers: Vec<Address>, threshold: u32) {
+        access::store_multisig_config(env, signers, threshold);
+    }
+    #[inline]
+    fn load_fee_config(env: &Env) -> Result<(Address, i128, i128), Error> {
+        fees::load_fee_config(env)
+    }
+    #[inline]
+    fn load_user_record(env: &Env, sender: &Address, current_time: u64) -> (u64, i128, i128, bool) {
+        storage::load_user_record(env, sender, current_time)
+    }
+    #[inline]
+    fn accrue_user_record(env: &Env, sender: &Address, amount: i128) -> Result<i128, Error> {
+        storage::accrue_user_record(env, sender, amount)
+    }
+    #[inline]
+    fn is_frozen_internal(env: &Env) -> bool {
+        access::is_frozen_internal(env)
+    }
+    #[inline]
+    fn bump_heartbeat(env: &Env) {
+        if env.storage().instance().has(&DataKey::BackupAdmin) {
+            env.storage()
+                .instance()
+                .set(&DataKey::LastHeartbeat, &env.ledger().timestamp());
         }
     }
+    #[inline]
+    fn rate_limit_raw(env: &Env) -> u32 {
+        rate_limit::rate_limit_raw(env)
+    }
+    #[inline]
+    fn is_whitelisted(env: &Env, address: &Address) -> bool {
+        rate_limit::is_whitelisted(env, address)
+    }
+    #[inline]
+    fn rate_limit_used(env: &Env, sender: &Address) -> u32 {
+        rate_limit::rate_limit_used(env, sender)
+    }
+    #[inline]
+    fn check_rate_limit(env: &Env, sender: &Address) -> Result<(), Error> {
+        rate_limit::check_rate_limit(env, sender)
+    }
+    #[inline]
+    fn is_paused_internal(env: &Env) -> bool {
+        access::is_paused_internal(env)
+    }
+    #[inline]
+    fn require_circuit_closed(env: &Env) -> Result<(), Error> {
+        access::require_circuit_closed(env)
+    }
+    #[inline]
+    fn calculate_fee(amount: i128, effective_fee_bps: i128, fee_cap: i128) -> (i128, i128) {
+        fees::calculate_fee(amount, effective_fee_bps, fee_cap)
+    }
 
-    fn load_fee_config(env: &Env) -> Result<(Address, i128, i128), Error> {
-        let platform_treasury: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::PlatformTreasury)
-            .ok_or(Error::NotInitialized)?;
-        let fee_bps: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::FeeBps)
-            .ok_or(Error::NotInitialized)?;
-        let fee_cap: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::FeeCap)
-            .ok_or(Error::NotInitialized)?;
-
-        env.storage().instance().extend_ttl(
-            Self::INSTANCE_LIFETIME_THRESHOLD,
-            Self::INSTANCE_BUMP_AMOUNT,
-        );
-
-        Ok((platform_treasury, fee_bps, fee_cap))
+    fn validate_swap_path(
+        token_in: &Address,
+        token_out: &Address,
+        path: &Vec<Address>,
+        min_amount_out: i128,
+    ) -> Result<(), Error> {
+        if path.is_empty() {
+            return Err(Error::InvalidSwapPath);
+        }
+        if path.first().is_none_or(|a| a != *token_in) {
+            return Err(Error::InvalidSwapPath);
+        }
+        if path.last().is_none_or(|a| a != *token_out) {
+            return Err(Error::InvalidSwapPath);
+        }
+        if min_amount_out <= 0 {
+            return Err(Error::InvalidSwapParams);
+        }
+        Ok(())
     }
 
     fn get_refund_balance_internal(env: &Env, user: &Address, token: &Address) -> i128 {
@@ -659,7 +201,7 @@ impl PaymentRouter {
         env.storage().persistent().get(&key).unwrap_or(0)
     }
 
-    fn credit_refund_balance(env: &Env, user: &Address, token: &Address, amount: i128) {
+    pub(crate) fn credit_refund_balance(env: &Env, user: &Address, token: &Address, amount: i128) {
         let key = DataKey::RefundBalance(user.clone(), token.clone());
         let current_balance: i128 = env.storage().persistent().get(&key).unwrap_or(0);
         let new_balance = current_balance + amount;
@@ -676,129 +218,21 @@ impl PaymentRouter {
         );
     }
 
-    /// Loads a sender's packed `UserRecord`, falling back to the legacy
-    /// pre-#663 split entries when no packed record exists yet.
-    ///
-    /// Returns `(last_reset_time, accumulated_amount, volume, legacy_found)`.
-    /// When neither format is present — the sender has never routed a payment —
-    /// the 24-hour window is anchored at `current_time` with zeroed counters.
-    /// `legacy_found` is `true` only when the values came from the legacy split
-    /// entries, telling the caller to drop those stale keys after writing the
-    /// packed record.
-    fn load_user_record(env: &Env, sender: &Address, current_time: u64) -> (u64, i128, i128, bool) {
-        let record_key = DataKey::UserRecord(sender.clone());
+    fn verify_kyc_for_amount(env: &Env, sender: &Address, amount: i128) -> Result<(), Error> {
+        let threshold: Option<i128> = env.storage().instance().get(&DataKey::KycThreshold);
+        if threshold.is_none() || amount <= threshold.unwrap_or(0) {
+            return Ok(());
+        }
 
-        if let Some(packed) = env
+        let oracle: Address = env
             .storage()
-            .persistent()
-            .get::<DataKey, BytesN<40>>(&record_key)
-        {
-            let (last_reset_time, accumulated_amount, volume) = unpack_user_record(&packed);
-            return (last_reset_time, accumulated_amount, volume, false);
-        }
-
-        // Legacy fallback: combine the pre-#663 split entries.
-        let legacy_spending: Option<(u64, i128)> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::UserSpending(sender.clone()))
-            .map(|packed: BytesN<24>| unpack_legacy_spending(&packed));
-        let legacy_volume: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::UserVolume(sender.clone()))
-            .unwrap_or(0);
-        let (last_reset_time, accumulated_amount) = legacy_spending.unwrap_or((current_time, 0));
-        let legacy_found = legacy_spending.is_some() || legacy_volume != 0;
-        (
-            last_reset_time,
-            accumulated_amount,
-            legacy_volume,
-            legacy_found,
-        )
-    }
-
-    /// Rolls the sender's 24-hour spending window forward by `amount`, adds
-    /// `amount` to their lifetime volume, and persists both in a single packed
-    /// `UserRecord` entry (issue #663). Rejects the payment when the daily cap
-    /// would be exceeded.
-    ///
-    /// Shared by the direct, meta-transaction and swap-routed payment paths so
-    /// all three apply the same window, reset and cap rules.
-    ///
-    /// Returns the sender's volume *before* this payment, which is what the
-    /// tiered fee discount is decided on.
-    fn accrue_user_record(env: &Env, sender: &Address, amount: i128) -> Result<i128, Error> {
-        let current_time = env.ledger().timestamp();
-        let record_key = DataKey::UserRecord(sender.clone());
-
-        let (mut last_reset_time, mut accumulated_amount, volume, legacy_found) =
-            Self::load_user_record(env, sender, current_time);
-
-        if current_time - last_reset_time >= Self::SECONDS_IN_24H {
-            last_reset_time = current_time;
-            accumulated_amount = 0;
-        }
-
-        let Some(new_accumulated) = accumulated_amount.checked_add(amount) else {
-            return Err(Error::LimitExceeded);
-        };
-        if new_accumulated > Self::DAILY_MAX_LIMIT {
-            return Err(Error::LimitExceeded);
-        }
-        accumulated_amount = new_accumulated;
-
-        let new_volume = volume.saturating_add(amount);
-
-        // One write and one TTL extension for both counters.
-        env.storage().persistent().set(
-            &record_key,
-            &pack_user_record(env, last_reset_time, accumulated_amount, new_volume),
-        );
-        env.storage().persistent().extend_ttl(
-            &record_key,
-            Self::PERSISTENT_LIFETIME_THRESHOLD,
-            Self::PERSISTENT_BUMP_AMOUNT,
-        );
-
-        // One-time cleanup: when this write consumed legacy split entries,
-        // drop them so the old keys stop accruing state rent. Steady-state
-        // payments skip both removals entirely.
-        if legacy_found {
-            env.storage()
-                .persistent()
-                .remove(&DataKey::UserSpending(sender.clone()));
-            env.storage()
-                .persistent()
-                .remove(&DataKey::UserVolume(sender.clone()));
-        }
-
-        Ok(volume)
-    }
-
-    /// Returns whether the contract is currently frozen.
-    fn is_frozen_internal(env: &Env) -> bool {
-        env.storage()
             .instance()
-            .get(&DataKey::Frozen)
-            .unwrap_or(false)
-    }
-
-    /// Splits `amount` into the platform fee and the amount forwarded to the
-    /// recipient, applying the fee cap and the volume-based discount.
-    ///
-    /// Shared by the direct and the swap-routed payment paths so both apply
-    /// byte-for-byte identical fee arithmetic; `prop_tests` mirrors this
-    /// function's invariants.
-    fn calculate_fee(amount: i128, effective_fee_bps: i128, fee_cap: i128) -> (i128, i128) {
-        let mut fee_amount = (amount * effective_fee_bps) / Self::BPS_DIVISOR;
-        if fee_amount > fee_cap {
-            fee_amount = fee_cap;
+            .get(&DataKey::KycOracle)
+            .ok_or(Error::KycRequired)?;
+        if !KycOracleClient::new(env, &oracle).is_verified(sender) {
+            return Err(Error::KycRequired);
         }
-        if fee_amount > amount {
-            fee_amount = amount;
-        }
-        (fee_amount, amount - fee_amount)
+        Ok(())
     }
 
     /// Returns the configured swap slippage ceiling in basis points.
@@ -807,6 +241,24 @@ impl PaymentRouter {
             .instance()
             .get(&DataKey::MaxSlippageBps)
             .unwrap_or(Self::DEFAULT_MAX_SLIPPAGE_BPS)
+    }
+
+    /// Resolve the token-pair override, falling back to the legacy global cap.
+    /// Corrupt or out-of-range persisted overrides fail closed.
+    fn pair_max_slippage_bps(
+        env: &Env,
+        token_in: &Address,
+        token_out: &Address,
+    ) -> Result<i128, Error> {
+        let configured: Option<i128> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PairSlippage(token_in.clone(), token_out.clone()));
+        match configured {
+            Some(bps) if (0..=Self::MAX_PAIR_SLIPPAGE_BPS).contains(&bps) => Ok(bps),
+            Some(_) => Err(Error::InvalidSlippageConfig),
+            None => Ok(Self::max_slippage_bps(env)),
+        }
     }
 
     /// Returns whether a DEX router has been approved for swap routing.
@@ -913,6 +365,7 @@ impl PaymentRouter {
 
     /// Builds the domain-separated message for meta-transactions.
     /// Binds `current_contract_address` + `MetaPayment` struct + `signer_pubkey`.
+    #[allow(clippy::too_many_arguments)]
     fn build_meta_message(
         env: &Env,
         sender: &Address,
@@ -937,6 +390,12 @@ impl PaymentRouter {
     }
 
     /// Core payment logic shared by `route_payment` and `route_payments`.
+    ///
+    /// The caller must have already obtained `sender`'s authorization, once
+    /// per distinct sender across the batch (or via `require_auth` for a
+    /// single payment). The transfers below re-check it inside the token
+    /// contract, but doing it here first means an unauthorized payment is
+    /// refused before any state is written.
     #[allow(clippy::too_many_arguments)]
     fn process_single_payment(
         env: &Env,
@@ -964,7 +423,6 @@ impl PaymentRouter {
         } else {
             fee_bps
         };
-
         // Verify sender has sufficient balance
         let token_client = token::Client::new(env, token_address);
         if token_client.balance(sender) < amount {
@@ -972,7 +430,14 @@ impl PaymentRouter {
         }
 
         // Calculate fee
-        let (fee_amount, remainder) = Self::calculate_fee(amount, effective_fee_bps, fee_cap);
+        let mut fee_amount = amount.saturating_mul(effective_fee_bps) / Self::BPS_DIVISOR;
+        if fee_amount > fee_cap {
+            fee_amount = fee_cap;
+        }
+        if fee_amount > amount {
+            fee_amount = amount;
+        }
+        let remainder = amount - fee_amount;
 
         // Execute transfers safely without panics
         if fee_amount > 0
@@ -1144,45 +609,6 @@ impl PaymentRouter {
     /// configuration, treasury yield movements and token recovery — are
     /// rejected with `Error::Paused`.
     ///
-    /// Essential recovery paths (unpausing/unfreezing, cancelling a queued
-    /// action, withdrawing refunds or emergency funds, role and admin
-    /// governance, compliance configuration and upgrades) deliberately bypass
-    /// this guard, so an incident can always be resolved while the breaker is
-    /// open.
-    fn require_circuit_closed(env: &Env) -> Result<(), Error> {
-        if Self::is_paused_internal(env) {
-            return Err(Error::Paused);
-        }
-        Ok(())
-    }
-
-    /// Returns whether the circuit breaker (pause switch) is currently open.
-    fn is_paused_internal(env: &Env) -> bool {
-        env.storage()
-            .instance()
-            .get(&DataKey::Paused)
-            .unwrap_or(false)
-    }
-
-    /// Enforces KYC only after the admin has configured a threshold. This
-    /// preserves existing routing behavior until compliance is enabled.
-    fn verify_kyc_for_amount(env: &Env, sender: &Address, amount: i128) -> Result<(), Error> {
-        let threshold: Option<i128> = env.storage().instance().get(&DataKey::KycThreshold);
-        if threshold.is_none() || amount <= threshold.unwrap_or(0) {
-            return Ok(());
-        }
-
-        let oracle: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::KycOracle)
-            .ok_or(Error::KycRequired)?;
-        if !KycOracleClient::new(env, &oracle).is_verified(sender) {
-            return Err(Error::KycRequired);
-        }
-        Ok(())
-    }
-
     /// One-time setup: records the admin and the initial fee configuration
     /// in instance storage. Must be called before `route_payment`.
     ///
@@ -1226,6 +652,7 @@ impl PaymentRouter {
         Self::set_role_internal(&env, Role::TreasuryManager, &admin);
         Self::set_role_internal(&env, Role::ComplianceOfficer, &admin);
         Self::set_role_internal(&env, Role::FeeManager, &admin);
+        Self::set_role_internal(&env, Role::Pauser, &admin);
 
         env.storage().instance().extend_ttl(
             Self::INSTANCE_LIFETIME_THRESHOLD,
@@ -1237,87 +664,108 @@ impl PaymentRouter {
 
     // ── Role-Based Access Control (RBAC) ────────────────────────────────────
 
-    /// Assigns an operational role to a specified account.
+    /// Grants an operational role to `grantee`.
     ///
-    /// Restricted exclusively to `SuperAdmin`.
+    /// Only an address holding `SuperAdmin` may call this.  The `admin`
+    /// parameter is the address expected to authorize the transaction, and
+    /// `admin.require_auth()` is always invoked, so a caller that cannot supply
+    /// that signature is rejected even if the role would otherwise resolve.
+    ///
+    /// # Parameters
+    /// - `admin`: Address expected to authorize the call; must hold `SuperAdmin`.
+    /// - `grantee`: Address to receive the role.
+    /// - `role`: The `Role` variant to grant.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, `Err(Error::RoleNotFound)` if `admin` does not hold
+    /// `SuperAdmin`, or `Err(Error::NotInitialized)` if the contract has no
+    /// admin set yet.
+    ///
+    /// # Panics
+    /// Panics if `admin` does not authorize the call.
+    ///
+    /// Granting a role the grantee already holds is a no-op that emits
+    /// `role_assigned` again rather than an error.  Because a role has a single
+    /// designated holder, granting it to a new address revokes it from the
+    /// previous one.
+    pub fn grant_role(env: Env, admin: Address, grantee: Address, role: Role) -> Result<(), Error> {
+        Self::require_role_of(&env, &admin, Role::SuperAdmin)?;
+        Self::apply_role_grant(&env, &grantee, role);
+        Ok(())
+    }
+
+    /// Revokes an operational role from `grantee`.
+    ///
+    /// Only an address holding `SuperAdmin` may call this.  As with
+    /// [`Self::grant_role`], `admin.require_auth()` is always invoked.
+    ///
+    /// # Parameters
+    /// - `admin`: Address expected to authorize the call; must hold `SuperAdmin`.
+    /// - `grantee`: Address from which the role will be revoked.
+    /// - `role`: The `Role` variant to revoke.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, `Err(Error::RoleNotFound)` if `admin` does not hold
+    /// `SuperAdmin`, `Err(Error::InvalidRole)` if the call would revoke the
+    /// acting `SuperAdmin`'s own root role, or `Err(Error::NotInitialized)`.
+    ///
+    /// # Panics
+    /// Panics if `admin` does not authorize the call.
+    ///
+    /// Revoking a role the grantee never held is a no-op that emits
+    /// `role_revoked` rather than an error, so revocations are idempotent and
+    /// safe to retry.
+    pub fn revoke_role(
+        env: Env,
+        admin: Address,
+        grantee: Address,
+        role: Role,
+    ) -> Result<(), Error> {
+        Self::require_role_of(&env, &admin, Role::SuperAdmin)?;
+        if role == Role::SuperAdmin && admin == grantee {
+            return Err(Error::InvalidRole);
+        }
+        Self::apply_role_revoke(&env, &grantee, role);
+        Ok(())
+    }
+
+    /// Grants an operational role to an account. SuperAdmin-protected.
+    ///
+    /// Retained for compatibility with the published bindings; this is
+    /// [`Self::grant_role`] with the `admin` argument resolved by the contract
+    /// instead of supplied by the caller.
     ///
     /// # Parameters
     /// - `account`: Target address to receive the role.
     /// - `role`: The `Role` variant to grant.
     ///
     /// # Returns
-    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if contract is uninitialized.
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if uninitialized.
     ///
     /// # Panics
     /// Panics if the current `SuperAdmin` does not authorize the call.
     pub fn assign_role(env: Env, account: Address, role: Role) -> Result<(), Error> {
+        // The resolved address is discarded: the point is the `require_auth()`
+        // that `require_role` performs on it.
         Self::require_role(&env, Role::SuperAdmin)?;
-        Self::set_role_internal(&env, role, &account);
-        env.events().publish(
-            (Symbol::new(&env, "role_assigned"), role, account),
-            env.ledger().timestamp(),
-        );
-        Ok(())
-    }
-
-    /// Revokes an operational role from a specified account.
-    ///
-    /// Restricted exclusively to `SuperAdmin`. Prevents removing the active SuperAdmin
-    /// when it would leave the contract without root governance.
-    ///
-    /// # Parameters
-    /// - `account`: Target address from which the role will be revoked.
-    /// - `role`: The `Role` variant to revoke.
-    ///
-    /// # Returns
-    /// `Ok(())` on success, `Err(Error::InvalidRole)` if attempting to revoke own SuperAdmin,
-    /// or `Err(Error::NotInitialized)`.
-    ///
-    /// # Panics
-    /// Panics if the current `SuperAdmin` does not authorize the call.
-    pub fn revoke_role(env: Env, account: Address, role: Role) -> Result<(), Error> {
-        let caller = Self::require_role(&env, Role::SuperAdmin)?;
-        if role == Role::SuperAdmin && caller == account {
-            return Err(Error::InvalidRole);
-        }
-        Self::remove_role_internal(&env, role, &account);
-        env.events().publish(
-            (Symbol::new(&env, "role_revoked"), role, account),
-            env.ledger().timestamp(),
-        );
+        Self::apply_role_grant(&env, &account, role);
         Ok(())
     }
 
     /// Queries whether a given account holds an active role assignment.
     ///
-    /// Checks persistent user role assignments and primary designated roles.
+    /// Read-only and authorization-free.  Reports effective authority: the
+    /// account is granted the role directly, is the role's designated holder,
+    /// or is the root admin standing in for a role that has not been delegated.
     ///
     /// # Parameters
     /// - `account`: Address to query.
     /// - `role`: Role variant to check.
     ///
     /// # Returns
-    /// `true` if authorized for this role, `false` otherwise.
+    /// `true` if the account can exercise `role`, `false` otherwise.
     pub fn has_role(env: Env, account: Address, role: Role) -> bool {
-        if let Some(has) = env
-            .storage()
-            .persistent()
-            .get::<DataKey, bool>(&DataKey::UserRole(account.clone(), role))
-        {
-            if has {
-                return true;
-            }
-        }
-        if let Some(primary) = env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::Role(role))
-        {
-            if primary == account {
-                return true;
-            }
-        }
-        false
+        Self::has_role_internal(&env, &account, role)
     }
 
     /// Returns the primary designated member address for a role, if one is configured.
@@ -1345,18 +793,11 @@ impl PaymentRouter {
     /// Queues an admin action to be executed after a 24-hour delay.
     ///
     /// The admin provides the desired `ActionType` variant and receives a
-    /// numeric nonce that uniquely identifies this pending entry.  Pass this
-    /// nonce to `execute_action` after 24 hours, or to `cancel_action` to
-    /// abort the intent.
+    /// numeric nonce identifying this entry. Pass this nonce to `execute_action`
+    /// after 24 hours, or to `cancel_action` to abort the intent.
     ///
-    /// Sensitive parameter changes (`set_platform_treasury`, `set_fee_config`,
-    /// `set_fee_bps`, `set_governance`, `set_min_limit`, `transfer_admin`,
-    /// `upgrade`) must go through the timelock.  Use the direct setter
-    /// functions only for actions that are not sensitive (e.g. `set_pause`
-    /// which can also be called directly for immediate operational pauses).
-    ///
-    /// The contract must not be frozen when queuing, and the admin must
-    /// authorize the call.
+    /// Sensitive parameter changes must go through the timelock.
+    /// The contract must not be frozen, and the admin must authorize.
     pub fn queue_action(env: Env, action: ActionType) -> Result<u64, Error> {
         if Self::is_frozen_internal(&env) {
             return Err(Error::ContractFrozen);
@@ -1415,92 +856,27 @@ impl PaymentRouter {
     /// - The admin must authorize.
     /// - The entry identified by `nonce` must exist.
     /// - At least 24 hours (`SECONDS_IN_24H`) must have passed since queuing.
+    /// - For [`ActionType::Upgrade`], the multi-signature threshold must
+    ///   already be met for that WASM hash.
     ///
     /// On success the entry is removed and the underlying setter is invoked.
     pub fn execute_action(env: Env, nonce: u64) -> Result<(), Error> {
-        if Self::is_frozen_internal(&env) {
-            return Err(Error::ContractFrozen);
-        }
-        // Circuit breaker: applying a queued parameter change is a
-        // non-essential state change and is blocked while paused.
-        Self::require_circuit_closed(&env)?;
+        timelock::execute_action(&env, nonce)
+    }
 
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
-
-        let key = DataKey::TimelockEntry(nonce);
-        let entry: TimelockEntry = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .ok_or(Error::TimelockNotFound)?;
-
-        let now = env.ledger().timestamp();
-        if now < entry.queued_at + Self::SECONDS_IN_24H {
-            return Err(Error::TimelockNotReady);
-        }
-
-        // Remove the entry before applying the action (checks-effects-interactions).
-        env.storage().persistent().remove(&key);
-
-        // Apply the action.
-        match entry.action {
-            ActionType::SetPlatformTreasury(new_treasury) => {
-                env.storage()
-                    .instance()
-                    .set(&DataKey::PlatformTreasury, &new_treasury);
-            }
-            ActionType::SetFeeConfig(fee_bps, fee_cap) => {
-                env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
-                env.storage().instance().set(&DataKey::FeeCap, &fee_cap);
-            }
-            ActionType::SetFeeBps(new_fee_bps) => {
-                env.storage().instance().set(&DataKey::FeeBps, &new_fee_bps);
-            }
-            ActionType::SetGovernance(gov) => {
-                env.storage().instance().set(&DataKey::Governance, &gov);
-            }
-            ActionType::SetMinLimit(min_limit) => {
-                env.storage().instance().set(&DataKey::MinLimit, &min_limit);
-            }
-            ActionType::TransferAdmin(new_admin) => {
-                env.storage().instance().set(&DataKey::Admin, &new_admin);
-                Self::set_role_internal(&env, Role::SuperAdmin, &new_admin);
-            }
-            ActionType::Upgrade(new_wasm_hash) => {
-                env.deployer().update_current_contract_wasm(new_wasm_hash);
-            }
-            ActionType::RegisterDex(dex) => {
-                let key = DataKey::RegisteredDex(dex.clone());
-                env.storage().persistent().set(&key, &true);
-                env.storage().persistent().extend_ttl(
-                    &key,
-                    Self::PERSISTENT_LIFETIME_THRESHOLD,
-                    Self::PERSISTENT_BUMP_AMOUNT,
-                );
-            }
-            ActionType::DeregisterDex(dex) => {
-                env.storage()
-                    .persistent()
-                    .remove(&DataKey::RegisteredDex(dex.clone()));
-            }
-            ActionType::SetMaxSlippageBps(max_slippage_bps) => {
-                env.storage()
-                    .instance()
-                    .set(&DataKey::MaxSlippageBps, &max_slippage_bps);
-            }
-        }
-
-        env.storage().instance().extend_ttl(
-            Self::INSTANCE_LIFETIME_THRESHOLD,
-            Self::INSTANCE_BUMP_AMOUNT,
-        );
-
-        env.events()
-            .publish((Symbol::new(&env, "action_executed"), admin), nonce);
-
-        log!(&env, "Timelock action executed for nonce {}", nonce);
-        Ok(())
+    /// Executes a batch of previously queued timelock actions sequentially within
+    /// a single atomic invocation.
+    ///
+    /// Requirements:
+    /// - The contract must not be frozen.
+    /// - Circuit breaker must be closed.
+    /// - The admin must authorize.
+    /// - All nonces in the batch must be verified ready and valid BEFORE any action is executed.
+    /// - All actions execute sequentially. If any action fails execution,
+    ///   the entire invocation reverts atomically.
+    /// - Emits `batch_actions_executed` event with the list of nonces.
+    pub fn execute_batch_actions(env: Env, nonces: Vec<u64>) -> Result<(), Error> {
+        timelock::execute_batch_actions(&env, nonces)
     }
 
     /// Cancels a pending timelock entry before it can be executed.
@@ -1579,6 +955,168 @@ impl PaymentRouter {
 
         log!(&env, "Contract unfrozen by SuperAdmin");
         Ok(())
+    }
+
+    // ── Rate limiting (issue #716) ───────────────────────────────────────
+
+    /// Sets the maximum number of payment invocations a single sender may
+    /// make per ledger sequence. Admin-only.
+    ///
+    /// Rate limiting is active immediately after `initialize` with a default
+    /// cap of 10 invocations per address per ledger. This setter changes the
+    /// cap; a value of `0` disables rate limiting entirely (whitelisting
+    /// individual addresses via `set_rate_limit_whitelist` is usually
+    /// preferable to disabling the limiter for everyone).
+    ///
+    /// # Parameters
+    /// - `max_calls_per_ledger`: Invocation cap per address per ledger.
+    ///   Must not exceed `MAX_RATE_LIMIT` (1,000,000).
+    ///
+    /// # Returns
+    /// `Ok(())` on success, `Err(Error::NotInitialized)` if the contract has
+    /// no admin set yet, or `Err(Error::LimitExceeded)` if the cap exceeds
+    /// `MAX_RATE_LIMIT`.
+    ///
+    /// # Panics
+    /// Panics if the current admin does not authorize the call.
+    pub fn set_rate_limit(env: Env, max_calls_per_ledger: u32) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        if max_calls_per_ledger > Self::MAX_RATE_LIMIT {
+            return Err(Error::LimitExceeded);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::RateLimitConfig, &max_calls_per_ledger);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "rate_limit_set"), admin),
+            max_calls_per_ledger,
+        );
+
+        log!(&env, "Rate limit updated");
+        Ok(())
+    }
+
+    /// Whitelists an address, exempting it from the per-ledger invocation cap
+    /// so legitimate high-volume senders are never throttled. Admin-only.
+    ///
+    /// # Parameters
+    /// - `address`: Sender to exempt from rate limiting.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
+    /// has no admin set yet.
+    ///
+    /// # Panics
+    /// Panics if the current admin does not authorize the call.
+    pub fn set_rate_limit_whitelist(env: Env, address: Address) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        let key = DataKey::RateLimitWhitelist(address.clone());
+        env.storage().persistent().set(&key, &true);
+        env.storage().persistent().extend_ttl(
+            &key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "rate_limit_whitelist_added"), address),
+            env.ledger().timestamp(),
+        );
+
+        log!(&env, "Address whitelisted from rate limiting");
+        Ok(())
+    }
+
+    /// Removes an address from the rate-limit whitelist, restoring the
+    /// standard per-ledger cap for it. Admin-only.
+    ///
+    /// # Parameters
+    /// - `address`: Sender to remove from the whitelist.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
+    /// has no admin set yet.
+    ///
+    /// # Panics
+    /// Panics if the current admin does not authorize the call.
+    pub fn remove_rate_limit_whitelist(env: Env, address: Address) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::RateLimitWhitelist(address.clone()));
+
+        env.events().publish(
+            (Symbol::new(&env, "rate_limit_whitelist_removed"), address),
+            env.ledger().timestamp(),
+        );
+
+        log!(&env, "Address removed from rate-limit whitelist");
+        Ok(())
+    }
+
+    /// Returns the active per-ledger invocation cap. A value of `0` means
+    /// rate limiting is disabled.
+    ///
+    /// # Returns
+    /// The configured cap, or the default cap (10) when no explicit
+    /// configuration has been stored.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn get_rate_limit(env: Env) -> u32 {
+        Self::rate_limit_raw(&env)
+    }
+
+    /// Returns whether an address is exempt from the rate limiter.
+    ///
+    /// # Parameters
+    /// - `address`: Address to check.
+    ///
+    /// # Returns
+    /// `true` if the address is on the rate-limit whitelist.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn is_rate_limit_whitelisted(env: Env, address: Address) -> bool {
+        Self::is_whitelisted(&env, &address)
+    }
+
+    /// Returns how many more payment invocations `sender` can make in the
+    /// current ledger under the active cap.
+    ///
+    /// # Parameters
+    /// - `sender`: Address whose remaining allowance to compute.
+    ///
+    /// # Returns
+    /// Remaining invocations in the current ledger window, saturating at 0
+    /// once the cap is reached. Whitelisted senders (and a disabled limiter)
+    /// report `u32::MAX`.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn get_rate_limit_remaining(env: Env, sender: Address) -> u32 {
+        let limit = Self::rate_limit_raw(&env);
+        if limit == 0 || Self::is_whitelisted(&env, &sender) {
+            return u32::MAX;
+        }
+
+        // Both operands are `u32`: the cap is read from `RateLimitConfig` and
+        // the counter from the packed `BytesN<8>`, so the remainder is at most
+        // the cap and needs no widening. `saturating_sub` pins it at 0 if a
+        // counter were somehow ahead of the cap.
+        limit.saturating_sub(Self::rate_limit_used(&env, &sender))
     }
 
     /// Returns whether the contract is currently frozen.
@@ -1790,72 +1328,6 @@ impl PaymentRouter {
         Ok(id)
     }
 
-    /// Casts one weighted vote on an open fee proposal.
-    pub fn vote_fee_proposal(
-        env: Env,
-        voter: Address,
-        proposal_id: u64,
-        support: bool,
-    ) -> Result<(), Error> {
-        voter.require_auth();
-        let token_address: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::GovernanceToken)
-            .ok_or(Error::GovernanceNotConfigured)?;
-        let key = DataKey::GovernanceProposal(proposal_id);
-        let mut proposal: FeeProposal = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .ok_or(Error::InvalidProposal)?;
-        if proposal.executed || env.ledger().timestamp() >= proposal.voting_ends_at {
-            return Err(Error::InvalidProposal);
-        }
-        let vote_key = DataKey::GovernanceVote(proposal_id, voter.clone());
-        if env.storage().persistent().has(&vote_key) {
-            return Err(Error::AlreadyVoted);
-        }
-        let weight = token::Client::new(&env, &token_address).balance(&voter);
-        if weight <= 0 {
-            return Err(Error::InvalidProposal);
-        }
-        if support {
-            proposal.yes_votes = proposal.yes_votes.saturating_add(weight);
-        } else {
-            proposal.no_votes = proposal.no_votes.saturating_add(weight);
-        }
-        env.storage().persistent().set(&key, &proposal);
-        env.storage().persistent().set(&vote_key, &true);
-        Ok(())
-    }
-
-    /// Finalizes a successful fee proposal after its voting period ends.
-    pub fn execute_fee_proposal(env: Env, proposal_id: u64) -> Result<(), Error> {
-        let key = DataKey::GovernanceProposal(proposal_id);
-        let mut proposal: FeeProposal = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .ok_or(Error::InvalidProposal)?;
-        if proposal.executed
-            || env.ledger().timestamp() < proposal.voting_ends_at
-            || proposal.yes_votes <= proposal.no_votes
-            || proposal.yes_votes.saturating_add(proposal.no_votes) < proposal.quorum
-        {
-            return Err(Error::InvalidProposal);
-        }
-        proposal.executed = true;
-        env.storage().persistent().set(&key, &proposal);
-        env.storage()
-            .instance()
-            .set(&DataKey::FeeBps, &proposal.fee_bps);
-        env.storage()
-            .instance()
-            .set(&DataKey::FeeCap, &proposal.fee_cap);
-        Ok(())
-    }
-
     pub fn get_fee_proposal(env: Env, proposal_id: u64) -> Option<FeeProposal> {
         env.storage()
             .persistent()
@@ -1901,7 +1373,7 @@ impl PaymentRouter {
         env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0)
     }
 
-    /// Pauses or unpauses the payment router. ComplianceOfficer-protected.
+    /// Pauses or unpauses the payment router. Pauser-protected.
     ///
     /// # Parameters
     /// - `paused`: `true` to reject `route_payment` / `route_payments`
@@ -1912,11 +1384,11 @@ impl PaymentRouter {
     /// has no admin set yet.
     ///
     /// # Panics
-    /// Panics if the current ComplianceOfficer does not authorize the call.
+    /// Panics if the current Pauser does not authorize the call.
     ///
     /// This is NOT timelocked — operational pausing must remain instant.
     pub fn set_pause(env: Env, paused: bool) -> Result<(), Error> {
-        Self::require_role(&env, Role::ComplianceOfficer)?;
+        Self::require_role(&env, Role::Pauser)?;
 
         env.storage().instance().set(&DataKey::Paused, &paused);
         env.storage().instance().extend_ttl(
@@ -1929,7 +1401,7 @@ impl PaymentRouter {
         Ok(())
     }
 
-    /// Alias for `set_pause`. Admin-only.
+    /// Alias for `set_pause`. Pauser-protected.
     ///
     /// # Parameters
     /// - `paused`: `true` to reject routing calls, `false` to allow them.
@@ -1938,7 +1410,7 @@ impl PaymentRouter {
     /// See `set_pause`.
     ///
     /// # Panics
-    /// Panics if the current admin does not authorize the call.
+    /// Panics if the current Pauser does not authorize the call.
     pub fn set_paused(env: Env, paused: bool) -> Result<(), Error> {
         Self::set_pause(env, paused)
     }
@@ -2201,43 +1673,92 @@ impl PaymentRouter {
         Ok(())
     }
 
-    /// Recovers tokens accidentally sent directly to the contract address. TreasuryManager-protected.
+    /// Arms the dead man's switch directly (bypassing the timelock).
     ///
     /// # Parameters
-    /// - `token`: Contract ID of the token to recover.
-    /// - `amount`: Amount to transfer from the contract's balance to the treasury manager.
+    /// - `backup`: Address allowed to claim admin rights after the timeout.
+    /// - `timeout_seconds`: Inactivity window in seconds. Must be at least
+    ///   `MIN_DMS_TIMEOUT` (7 days).
     ///
     /// # Returns
     /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
-    /// has no admin set yet.
+    /// has no admin set yet, or `Err(Error::InvalidDmsConfig)` if
+    /// `timeout_seconds` is below the minimum or `backup` equals the
+    /// current admin.
     ///
     /// # Panics
-    /// Panics if the current TreasuryManager does not authorize the call, or if the
-    /// token transfer fails (e.g. the contract's balance is below `amount`).
-    pub fn recover_tokens(env: Env, token: Address, amount: i128) -> Result<(), Error> {
-        // Circuit breaker: token recovery is a non-essential state change (the
-        // TreasuryManager still has `emergency_withdraw` while paused).
-        Self::require_circuit_closed(&env)?;
-        let treasury_mgr = Self::require_role(&env, Role::TreasuryManager)?;
+    /// Panics if the current admin does not authorize the call.
+    pub fn set_backup_admin_internal(
+        env: Env,
+        backup: Address,
+        timeout_seconds: u64,
+    ) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+        Self::apply_set_backup_admin(&env, backup, timeout_seconds)
+    }
 
-        let contract_address = env.current_contract_address();
-        let token_client = token::Client::new(&env, &token);
-        token_client.transfer(&contract_address, &treasury_mgr, &amount);
+    /// Shared implementation for arming the dead man's switch: validates the
+    /// configuration, stores the backup admin and timeout, and starts the
+    /// claim clock. Performs NO authorization; callers must do that first
+    /// (direct admin call or timelock execution).
+    pub(crate) fn apply_set_backup_admin(
+        env: &Env,
+        backup: Address,
+        timeout_seconds: u64,
+    ) -> Result<(), Error> {
+        if timeout_seconds < Self::MIN_DMS_TIMEOUT {
+            return Err(Error::InvalidDmsConfig);
+        }
+        let admin = Self::require_admin(env)?;
+        if backup == admin {
+            return Err(Error::InvalidDmsConfig);
+        }
 
+        env.storage().instance().set(&DataKey::BackupAdmin, &backup);
+        env.storage()
+            .instance()
+            .set(&DataKey::DmsTimeout, &timeout_seconds);
+        // The claim clock starts ticking from the moment the switch is armed.
+        env.storage()
+            .instance()
+            .set(&DataKey::LastHeartbeat, &env.ledger().timestamp());
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (Symbol::new(env, "backup_admin_set"), admin),
+            (backup, timeout_seconds),
+        );
+
+        log!(env, "Dead man's switch armed");
         Ok(())
     }
 
-    /// Records a token as supported (no-op; routing accepts any token contract ID).
+    /// Disables the dead man's switch, removing the backup admin and its
+    /// claim window. The inactivity timeout is left in storage untouched so
+    /// a later re-arming (via timelock) can reuse it.
     ///
-    /// # Parameters
-    /// - `_token`: Ignored; present for API compatibility.
-    ///
-    /// # Returns
-    /// Always `Ok(())`.
-    ///
-    /// # Panics
-    /// Does not panic.
-    pub fn add_supported_token(_env: Env, _token: Address) -> Result<(), Error> {
+    /// Admin authorization is required.
+    pub fn remove_backup_admin(env: Env) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        env.storage().instance().remove(&DataKey::BackupAdmin);
+        env.storage().instance().remove(&DataKey::LastHeartbeat);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "backup_admin_removed"), admin),
+            env.ledger().timestamp(),
+        );
+
+        log!(&env, "Dead man's switch disarmed");
         Ok(())
     }
 
@@ -2641,19 +2162,209 @@ impl PaymentRouter {
     /// - `amount`: Amount to route, in the token's smallest unit. Must be
     ///   positive and within the configured min/max and daily-limit bounds.
     ///
+    /// This is the primary way for the admin to reset the timer without
+    /// changing any contract state. Routing a payment also bumps the
+    /// heartbeat automatically. A no-op when no backup admin is configured.
+    ///
+    /// Admin authorization is required. Works even while the contract is
+    /// frozen so the legitimate admin can keep the switch alive.
+    pub fn ping(env: Env) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        Self::bump_heartbeat(&env);
+
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events()
+            .publish((symbol_short!("ping"), admin), env.ledger().timestamp());
+
+        log!(&env, "Admin heartbeat recorded");
+        Ok(())
+    }
+
+    /// Dead man's switch claim: transfers admin rights to `claimant` if they
+    /// are the configured backup admin and the admin has not pinged (directly
+    /// or via routing a payment) for at least the configured timeout.
+    ///
+    /// Deliberately NOT timelocked and NOT blocked by a contract freeze: if
+    /// the primary admin is gone there is nobody left to execute a queued
+    /// action, and freezing must not be able to brick recovery.
+    ///
+    /// # Parameters
+    /// - `claimant`: Address claiming admin rights. Must be the configured
+    ///   backup admin and must authorize the call.
+    ///
     /// # Returns
-    /// `Ok(())` on success. Returns `Err(Error::Paused)` if routing is
-    /// paused, `Err(Error::NotInitialized)` if the contract has no admin
-    /// set, `Err(Error::InvalidRecipient)` if `sender == recipient`,
-    /// `Err(Error::Blacklisted)` if `recipient` is blacklisted,
-    /// `Err(Error::LimitExceeded)` if `amount` is outside the configured
-    /// bounds or exceeds the sender's remaining daily limit, or
-    /// `Err(Error::InsufficientBalance)` if `sender`'s token balance is
-    /// below `amount`.
+    /// `Ok(())` on success, `Err(Error::NoBackupAdmin)` if no backup is
+    /// configured, `Err(Error::Unauthorized)` if `claimant` is not the
+    /// backup, or `Err(Error::DmsNotReady)` if the timeout has not elapsed.
+    pub fn claim_admin(env: Env, claimant: Address) -> Result<(), Error> {
+        claimant.require_auth();
+
+        let backup: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::BackupAdmin)
+            .ok_or(Error::NoBackupAdmin)?;
+
+        if claimant != backup {
+            return Err(Error::Unauthorized);
+        }
+
+        let timeout: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DmsTimeout)
+            .ok_or(Error::InvalidDmsConfig)?;
+        let last_heartbeat: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LastHeartbeat)
+            .ok_or(Error::InvalidDmsConfig)?;
+
+        let now = env.ledger().timestamp();
+        if now < last_heartbeat.saturating_add(timeout) {
+            return Err(Error::DmsNotReady);
+        }
+
+        env.storage().instance().set(&DataKey::Admin, &claimant);
+        // Fully disarm the switch: the backup is consumed and the clock is
+        // cleared so the new admin starts from a clean slate (re-arm via the
+        // timelock if desired).
+        env.storage().instance().remove(&DataKey::BackupAdmin);
+        env.storage().instance().remove(&DataKey::LastHeartbeat);
+        env.storage().instance().remove(&DataKey::DmsTimeout);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events()
+            .publish((Symbol::new(&env, "admin_claimed"), claimant.clone()), now);
+
+        log!(&env, "Admin claimed via dead man's switch");
+        Ok(())
+    }
+
+    /// Returns the current admin address.
+    ///
+    /// # Returns
+    /// `Some(admin)` if the contract is initialized, otherwise `None`.
     ///
     /// # Panics
-    /// Panics if `sender` does not authorize the call, or if the underlying
-    /// token transfer to `platform_treasury` fails.
+    /// Does not panic.
+    pub fn get_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Admin)
+    }
+
+    /// Returns the dead man's switch configuration.
+    ///
+    /// # Returns
+    /// `(backup_admin, timeout_seconds, last_heartbeat, seconds_since_heartbeat)`.
+    /// `backup_admin` is `None` and the timestamps `0` when no backup is
+    /// configured.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn get_dead_mans_switch(env: Env) -> (Option<Address>, u64, u64, u64) {
+        let backup = env.storage().instance().get(&DataKey::BackupAdmin);
+        let timeout: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DmsTimeout)
+            .unwrap_or(0);
+        let last: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LastHeartbeat)
+            .unwrap_or(0);
+        let now = env.ledger().timestamp();
+        let elapsed = if backup.is_some() {
+            now.saturating_sub(last)
+        } else {
+            0
+        };
+        (backup, timeout, last, elapsed)
+    }
+
+    /// Returns `true` if the dead man's switch is armed (a backup admin is
+    /// configured) and the timeout has elapsed, i.e. `claim_admin` would
+    /// currently succeed for the backup.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn is_dead_mans_switch_expired(env: Env) -> bool {
+        let backup_set = env.storage().instance().has(&DataKey::BackupAdmin);
+        if !backup_set {
+            return false;
+        }
+        let timeout: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DmsTimeout)
+            .unwrap_or(0);
+        let last: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LastHeartbeat)
+            .unwrap_or(0);
+        env.ledger().timestamp().saturating_sub(last) >= timeout
+    }
+
+    /// Recovers tokens accidentally sent directly to the contract address. Admin-only.
+    ///
+    /// # Parameters
+    /// - `token`: Contract ID of the token to recover.
+    /// - `amount`: Amount to transfer from the contract's balance to the admin.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
+    /// has no admin set yet.
+    ///
+    /// # Panics
+    /// Panics if the current admin does not authorize the call, or if the
+    /// token transfer fails (e.g. the contract's balance is below `amount`).
+    pub fn recover_tokens(env: Env, token: Address, amount: i128) -> Result<(), Error> {
+        // Circuit breaker: token recovery is a non-essential state change (the
+        // TreasuryManager still has `emergency_withdraw` while paused).
+        Self::require_circuit_closed(&env)?;
+        let treasury_mgr = Self::require_role(&env, Role::TreasuryManager)?;
+
+        let contract_address = env.current_contract_address();
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&contract_address, &treasury_mgr, &amount);
+
+        Ok(())
+    }
+
+    /// Records a token as supported (no-op; routing accepts any token contract ID).
+    ///
+    /// # Parameters
+    /// - `_token`: Ignored; present for API compatibility.
+    ///
+    /// # Returns
+    /// Always `Ok(())`.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn add_supported_token(_env: Env, _token: Address) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Routes a payment from a sender to a recipient, deducting a platform fee.
+    ///
+    /// # Parameters
+    /// - `sender`: Address funds are debited from; must authorize call.
+    /// - `recipient`: Address to receive funds (minus platform fee).
+    /// - `token_address`: Contract ID of token transferred.
+    /// - `amount`: Amount to route, in token's smallest unit.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or appropriate `Error` on failure.
     pub fn route_payment(
         env: Env,
         sender: Address,
@@ -2661,6 +2372,7 @@ impl PaymentRouter {
         token_address: Address,
         amount: i128,
     ) -> Result<(), Error> {
+        let _guard = ReentrancyGuard::new(&env)?;
         if Self::is_frozen_internal(&env) {
             return Err(Error::ContractFrozen);
         }
@@ -2679,6 +2391,10 @@ impl PaymentRouter {
             .get(&DataKey::MinLimit)
             .unwrap_or(0);
 
+        // Validate everything that can be checked without auth first: a
+        // `require_auth` abort rolls back the whole invocation, so rejecting
+        // bad input before authenticating avoids turning ordinary validation
+        // errors into an opaque host rollback panic.
         if sender == recipient {
             return Err(Error::InvalidRecipient);
         }
@@ -2695,6 +2411,10 @@ impl PaymentRouter {
 
         sender.require_auth();
 
+        // Contract-level rate limiting (issue #716): one invocation slot per
+        // payment, consumed after auth so only authorized senders are counted.
+        Self::check_rate_limit(&env, &sender)?;
+
         let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
 
         Self::process_single_payment(
@@ -2706,7 +2426,257 @@ impl PaymentRouter {
             &platform_treasury,
             fee_bps,
             fee_cap,
+        )?;
+
+        // A successful routing proves the platform is alive and serving, so
+        // bump the dead man's switch heartbeat (no-op without a backup admin).
+        Self::bump_heartbeat(&env);
+
+        Ok(())
+    }
+
+    /// Swaps `token_in` through a caller-supplied DEX path and routes the
+    /// resulting `token_out` to the recipient. The DEX adapter must return the
+    /// received output and any unused input as `[received, unused]`; unused
+    /// input is credited to the sender's refund balance.
+    ///
+    /// # Panics
+    /// Panics if the DEX router returns a swap result with fewer than 2 elements,
+    /// or if `swap_result.get(0)` or `swap_result.get(1)` returns `None`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn route_payment_with_swap_raw(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        dex_router: Address,
+        token_in: Address,
+        token_out: Address,
+        amount_in: i128,
+        path: Vec<Address>,
+        min_amount_out: i128,
+    ) -> Result<(), Error> {
+        if Self::is_frozen_internal(&env) {
+            return Err(Error::ContractFrozen);
+        }
+        if Self::is_paused(env.clone()) {
+            return Err(Error::Paused);
+        }
+        if sender == recipient {
+            return Err(Error::InvalidRecipient);
+        }
+        if Self::is_blacklisted(env.clone(), recipient.clone()) {
+            return Err(Error::Blacklisted);
+        }
+        Self::validate_swap_path(&token_in, &token_out, &path, min_amount_out)?;
+
+        let max_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxAmount)
+            .unwrap_or(Self::MAX_AMOUNT);
+        let min_limit: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinLimit)
+            .unwrap_or(0);
+        if amount_in <= 0 || amount_in > max_amount || amount_in < min_limit {
+            return Err(Error::LimitExceeded);
+        }
+        Self::verify_kyc_for_amount(&env, &sender, amount_in)?;
+        sender.require_auth();
+
+        let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
+        let token_in_client = token::Client::new(&env, &token_in);
+        token_in_client.transfer(&sender, &dex_router, &amount_in);
+
+        let swap_result = DexRouterClient::new(&env, &dex_router).swap_exact_tokens_for_tokens(
+            &token_in,
+            &token_out,
+            &amount_in,
+            &min_amount_out,
+            &path,
+            &env.current_contract_address(),
+        );
+        if swap_result.len() != 2 {
+            return Err(Error::InvalidSwapPath);
+        }
+        let amount_received: i128 = swap_result.get(0).unwrap();
+        let unused_input: i128 = swap_result.get(1).unwrap();
+        if amount_received < min_amount_out || amount_received <= 0 || unused_input < 0 {
+            return Err(Error::SlippageExceeded);
+        }
+        if unused_input > 0 {
+            token_in_client.transfer(&env.current_contract_address(), &sender, &unused_input);
+        }
+
+        Self::process_single_payment(
+            &env,
+            &sender,
+            &recipient,
+            &token_out,
+            amount_received,
+            &platform_treasury,
+            fee_bps,
+            fee_cap,
         )
+    }
+
+    /// Routes a payment through two to four consecutive DEX swaps. `path`
+    /// contains the input asset followed by every intermediate asset and the
+    /// output asset. `min_amounts_out[i]` is the required output for hop `i`.
+    /// Any input dust returned by a hop is refunded to `sender` in that hop's
+    /// input asset. All swaps and settlement are atomic.
+    pub fn route_multihop_swap(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        dex_router: Address,
+        amount_in: i128,
+        path: Vec<Address>,
+        min_amounts_out: Vec<i128>,
+    ) -> Result<i128, Error> {
+        let _guard = ReentrancyGuard::new(&env)?;
+        if Self::is_frozen_internal(&env) {
+            return Err(Error::ContractFrozen);
+        }
+        if Self::is_paused(env.clone()) {
+            return Err(Error::Paused);
+        }
+        if sender == recipient {
+            return Err(Error::InvalidRecipient);
+        }
+        if Self::is_blacklisted(env.clone(), recipient.clone()) {
+            return Err(Error::Blacklisted);
+        }
+
+        let hop_count = path.len().saturating_sub(1);
+        if !(2..=4).contains(&hop_count) || min_amounts_out.len() != hop_count {
+            return Err(Error::InvalidSwapPath);
+        }
+        // Paths are intentionally short (at most five assets), so checking
+        // every pair keeps the cycle guard simple and bounded.
+        for i in 0..path.len() {
+            let asset = path.get(i).ok_or(Error::InvalidSwapPath)?;
+            for j in (i + 1)..path.len() {
+                if path.get(j).as_ref() == Some(&asset) {
+                    return Err(Error::CyclicSwapPath);
+                }
+            }
+        }
+        for floor in min_amounts_out.iter() {
+            if floor <= 0 {
+                return Err(Error::InvalidSwapParams);
+            }
+        }
+        if !Self::is_dex_registered_internal(&env, &dex_router) {
+            return Err(Error::DexNotRegistered);
+        }
+
+        let max_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxAmount)
+            .unwrap_or(Self::MAX_AMOUNT);
+        let min_limit: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinLimit)
+            .unwrap_or(0);
+        if amount_in <= 0 || amount_in > max_amount || amount_in < min_limit {
+            return Err(Error::LimitExceeded);
+        }
+        Self::verify_kyc_for_amount(&env, &sender, amount_in)?;
+        sender.require_auth();
+        Self::check_rate_limit(&env, &sender)?;
+
+        let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
+        let user_volume = Self::accrue_user_record(&env, &sender, amount_in)?;
+        let effective_fee_bps = if user_volume > Self::VOLUME_THRESHOLD {
+            fee_bps / 2
+        } else {
+            fee_bps
+        };
+        let contract_address = env.current_contract_address();
+        let first_token = path.get(0).ok_or(Error::InvalidSwapPath)?;
+        let input_client = token::Client::new(&env, &first_token);
+        if input_client.balance(&sender) < amount_in {
+            return Err(Error::InsufficientBalance);
+        }
+        input_client.transfer(&sender, &contract_address, &amount_in);
+
+        let mut current_amount = amount_in;
+        for i in 0..hop_count {
+            let token_in = path.get(i).ok_or(Error::InvalidSwapPath)?;
+            let token_out = path.get(i + 1).ok_or(Error::InvalidSwapPath)?;
+            let floor = min_amounts_out.get(i).ok_or(Error::InvalidSwapPath)?;
+            let token_in_client = token::Client::new(&env, &token_in);
+            let token_out_client = token::Client::new(&env, &token_out);
+            let input_before = token_in_client.balance(&contract_address);
+            let output_before = token_out_client.balance(&contract_address);
+            token_in_client.transfer(&contract_address, &dex_router, &current_amount);
+            let hop_path = vec![&env, token_in.clone(), token_out.clone()];
+            let result = DexRouterClient::new(&env, &dex_router).swap_exact_tokens_for_tokens(
+                &token_in,
+                &token_out,
+                &current_amount,
+                &floor,
+                &hop_path,
+                &contract_address,
+            );
+            if result.len() != 2 {
+                return Err(Error::InvalidSwapPath);
+            }
+            let reported_out: i128 = result.get(0).ok_or(Error::SwapFailed)?;
+            let reported_unused: i128 = result.get(1).ok_or(Error::SwapFailed)?;
+            let input_after = token_in_client.balance(&contract_address);
+            let output_after = token_out_client.balance(&contract_address);
+            let actual_unused = input_after - (input_before - current_amount);
+            let actual_out = output_after - output_before;
+            if reported_unused < 0
+                || reported_unused > current_amount
+                || actual_unused != reported_unused
+                || reported_out != actual_out
+                || actual_out < floor
+                || actual_out <= 0
+            {
+                return Err(Error::SlippageExceeded);
+            }
+            if actual_unused > 0 {
+                // The path cannot revisit an asset, so this hop's unused input
+                // is no longer needed by a later hop.
+                token_in_client.transfer(&contract_address, &sender, &actual_unused);
+            }
+            env.events().publish(
+                (
+                    Symbol::new(&env, "swap_hop"),
+                    dex_router.clone(),
+                    token_in,
+                    token_out,
+                ),
+                (current_amount, actual_out, actual_unused, floor),
+            );
+            current_amount = actual_out;
+        }
+
+        let final_token = path.get(path.len() - 1).ok_or(Error::InvalidSwapPath)?;
+        let output_client = token::Client::new(&env, &final_token);
+        let (fee_amount, remainder) =
+            Self::calculate_fee(current_amount, effective_fee_bps, fee_cap);
+        if fee_amount > 0 {
+            output_client.transfer(&contract_address, &platform_treasury, &fee_amount);
+        }
+        if remainder > 0 {
+            match output_client.try_transfer(&contract_address, &recipient, &remainder) {
+                Ok(Ok(())) => {}
+                _ => Self::credit_refund_balance(&env, &sender, &final_token, remainder),
+            }
+        }
+        env.events().publish(
+            (symbol_short!("routed"), sender.clone(), recipient.clone()),
+            remainder,
+        );
+        Self::bump_heartbeat(&env);
+        Ok(remainder)
     }
 
     /// Routes multiple payments in a single transaction. If any payment fails,
@@ -2726,6 +2696,7 @@ impl PaymentRouter {
     /// Panics if any payment's `sender` does not authorize the call, or if
     /// a token transfer to `platform_treasury` fails.
     pub fn route_payments(env: Env, payments: Vec<Payment>) -> Result<(), Error> {
+        let _guard = ReentrancyGuard::new(&env)?;
         if Self::is_frozen_internal(&env) {
             return Err(Error::ContractFrozen);
         }
@@ -2746,6 +2717,8 @@ impl PaymentRouter {
             .get(&DataKey::MinLimit)
             .unwrap_or(0);
 
+        // Collect unique senders to require auth only once per sender.
+        let mut seen_senders = Vec::new(&env);
         for payment in payments.iter() {
             if payment.sender == payment.recipient {
                 return Err(Error::InvalidRecipient);
@@ -2760,11 +2733,31 @@ impl PaymentRouter {
                 return Err(Error::LimitExceeded);
             }
             Self::verify_kyc_for_amount(&env, &payment.sender, payment.amount)?;
+            // Contract-level rate limiting (issue #716): one invocation slot
+            // per payment, so a batch costs the sender one slot per item.
+            // Charged here, after auth, so only authorized senders are counted.
+            // A later failure reverts the whole batch and refunds every slot.
+            Self::check_rate_limit(&env, &payment.sender)?;
 
-            payment.sender.require_auth();
+            // Track unique senders for auth
+            let mut is_new = true;
+            for seen in seen_senders.iter() {
+                if seen == payment.sender {
+                    is_new = false;
+                    break;
+                }
+            }
+            if is_new {
+                seen_senders.push_back(payment.sender.clone());
+                payment.sender.require_auth();
+            }
         }
 
         let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
+
+        // Successful routing proves the platform is alive and serving, so
+        // bump the dead man's switch heartbeat (no-op without a backup admin).
+        Self::bump_heartbeat(&env);
 
         for payment in payments.iter() {
             Self::process_single_payment(
@@ -2778,6 +2771,10 @@ impl PaymentRouter {
                 fee_cap,
             )?;
         }
+
+        // A successful batch proves the platform is alive and serving, so
+        // bump the dead man's switch heartbeat (no-op without a backup admin).
+        Self::bump_heartbeat(&env);
 
         Ok(())
     }
@@ -2794,26 +2791,19 @@ impl PaymentRouter {
     /// Routes a payment authorised by an off-chain relayer's Ed25519 signature
     /// instead of the sender's on-chain authorization.
     ///
-    /// The relayer signs a canonical payload binding the sender, recipient,
-    /// token, amount, nonce and deadline. The contract verifies the signature,
-    /// burns the nonce to block replays, and then settles the payment through
-    /// the same accounting as a direct `route_payment`.
-    ///
     /// # Parameters
-    /// - `sender`: Address whose funds are routed and whose nonce is consumed.
-    /// - `signer_pubkey`: Ed25519 public key that must have signed the payload.
-    /// - `recipient`: Address the funds are delivered to.
-    /// - `token_address`: Contract ID of the token being transferred.
-    /// - `amount`: Amount to route in the token's smallest unit.
-    /// - `nonce`: Must equal the sender's current meta-transaction nonce.
-    /// - `deadline`: Ledger timestamp after which the submission is rejected.
-    /// - `signature`: Ed25519 signature over the canonical payload.
+    /// - `sender`: Address whose funds are routed.
+    /// - `signer_pubkey`: Ed25519 public key that signed the payload.
+    /// - `recipient`: Destination address.
+    /// - `token_address`: Token contract ID.
+    /// - `amount`: Amount to route.
+    /// - `nonce`: Sender's current meta-transaction nonce.
+    /// - `deadline`: Expiration timestamp.
+    /// - `signature`: Ed25519 signature over canonical payload.
     ///
     /// # Returns
     /// `Ok(())` once the payment has settled.
-    ///
-    /// # Panics
-    /// Panics if the signature does not verify.
+    #[allow(clippy::too_many_arguments)]
     pub fn route_payment_meta(
         env: Env,
         sender: Address,
@@ -2825,6 +2815,7 @@ impl PaymentRouter {
         deadline: u64,
         signature: BytesN<64>,
     ) -> Result<(), Error> {
+        let _guard = ReentrancyGuard::new(&env)?;
         if Self::is_frozen_internal(&env) {
             return Err(Error::ContractFrozen);
         }
@@ -3024,7 +3015,8 @@ impl PaymentRouter {
             return Err(Error::SlippageExceeded);
         }
         if swap.expected_amount_out > 0 {
-            let max_slippage_bps = Self::max_slippage_bps(env);
+            let max_slippage_bps =
+                Self::pair_max_slippage_bps(env, &swap.sell_token, &swap.buy_token)?;
             let slippage_floor = Self::slippage_floor(swap.expected_amount_out, max_slippage_bps);
             if amount_out < slippage_floor {
                 log!(
@@ -3106,6 +3098,7 @@ impl PaymentRouter {
     /// Panics if `payment.sender` does not authorize the call, or if a token
     /// transfer out of this contract fails.
     pub fn route_payment_with_swap(env: Env, payment: SwapPayment) -> Result<i128, Error> {
+        let _guard = ReentrancyGuard::new(&env)?;
         if Self::is_frozen_internal(&env) {
             return Err(Error::ContractFrozen);
         }
@@ -3135,6 +3128,7 @@ impl PaymentRouter {
     /// Panics if any payment's `sender` does not authorize the call, or if a
     /// token transfer out of this contract fails.
     pub fn route_payments_with_swap(env: Env, payments: Vec<SwapPayment>) -> Result<i128, Error> {
+        let _guard = ReentrancyGuard::new(&env)?;
         if Self::is_frozen_internal(&env) {
             return Err(Error::ContractFrozen);
         }
@@ -3197,7 +3191,7 @@ impl PaymentRouter {
             return Err(Error::InvalidSwapParams);
         }
 
-        let max_slippage_bps = Self::max_slippage_bps(&env);
+        let max_slippage_bps = Self::pair_max_slippage_bps(&env, &sell_token, &buy_token)?;
 
         Ok(SwapQuote {
             amount_out,
@@ -3336,6 +3330,39 @@ impl PaymentRouter {
         Self::max_slippage_bps(&env)
     }
 
+    /// Returns the configured cap for `(token_in, token_out)`, or the global
+    /// cap when no pair override exists. Invalid stored overrides fail closed.
+    pub fn get_pair_max_slippage_bps(
+        env: Env,
+        token_in: Address,
+        token_out: Address,
+    ) -> Result<i128, Error> {
+        Self::pair_max_slippage_bps(&env, &token_in, &token_out)
+    }
+
+    /// Sets a pair-specific slippage cap. Prefer the timelocked
+    /// `SetPairMaxSlippageBps` action for production configuration.
+    pub fn set_pair_max_slippage_bps(
+        env: Env,
+        token_in: Address,
+        token_out: Address,
+        max_slippage_bps: i128,
+    ) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+        if !(0..=Self::MAX_PAIR_SLIPPAGE_BPS).contains(&max_slippage_bps) {
+            return Err(Error::InvalidSlippageConfig);
+        }
+        let key = DataKey::PairSlippage(token_in, token_out);
+        env.storage().persistent().set(&key, &max_slippage_bps);
+        env.storage().persistent().extend_ttl(
+            &key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+        Ok(())
+    }
+
     /// Returns the available internal refund balance for a user and token.
     ///
     /// # Parameters
@@ -3456,46 +3483,334 @@ impl PaymentRouter {
     /// Panics if the current TreasuryManager does not authorize the call, or if the
     /// token transfer fails (e.g. the contract's balance is below `amount`).
     pub fn emergency_withdraw(env: Env, token: Address, amount: i128) -> Result<(), Error> {
+        let _guard = ReentrancyGuard::new(&env)?;
         let treasury_mgr = Self::require_role(&env, Role::TreasuryManager)?;
 
+        if amount <= 0 {
+            return Err(Error::LimitExceeded);
+        }
+
         let token_client = token::Client::new(&env, &token);
-        token_client.transfer(&env.current_contract_address(), &treasury_mgr, &amount);
+        let contract_address = env.current_contract_address();
+        if amount > token_client.balance(&contract_address) {
+            return Err(Error::InsufficientBalance);
+        }
+        token_client.transfer(&contract_address, &treasury_mgr, &amount);
 
         log!(&env, "Emergency withdraw executed by TreasuryManager");
         Ok(())
     }
 
-    /// Replaces this contract's WASM with a previously uploaded version. SuperAdmin-protected.
+    // ── Multi-signature (M-of-N) contract upgrades ───────────────────────────
+    //
+    // Issue #664: upgrades used to be gated on a single admin key, which made
+    // that key both a single point of failure (lose it and the contract can
+    // never be patched) and a single point of centralization (compromise it and
+    // an attacker owns the contract).  Upgrades now require M signatures drawn
+    // from an N-member admin group, so no single key — including the admin's —
+    // can upgrade the contract on its own.
+    //
+    // The flow is:
+    //   1. The admin configures the group once with `set_multisig_config`.
+    //   2. Each signer authorizes a specific WASM hash with `approve_upgrade`.
+    //   3. Once M signatures are collected, `upgrade` (or the timelock's
+    //      `ActionType::Upgrade`) installs that exact hash and the approvals
+    //      are consumed.
+    //
+    // Until step 1 happens every upgrade fails closed with
+    // `Error::MultisigNotInitialized`; there is deliberately no fallback to the
+    // single admin key, because that fallback is the vulnerability being fixed.
+
+    // The admin is the root of trust for this call only: it can re-point the
+    // group but still cannot upgrade the contract by itself. Prefer
+    // `queue_action(ActionType::SetMultisigConfig(…))` to put the 24-hour
+    // timelock in front of a rotation, which this direct setter bypasses.
+    /// Configures the multi-signature admin group that authorizes upgrades.
+    ///
+    /// The signer set is replaced wholesale: addresses that are not in
+    /// `signers` immediately lose the ability to approve, and a threshold
+    /// already reached for a pending hash is re-evaluated against the new
+    /// configuration.
+    ///
+    /// # Parameters
+    /// - `signers`: The N addresses whose signatures count. Must be non-empty
+    ///   and free of duplicates.
+    /// - `threshold`: The M signers required to authorize an upgrade, in
+    ///   `1..=signers.len()`.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, `Err(Error::InvalidMultisigConfig)` if the signer
+    /// set is empty or holds a duplicate, or the threshold is zero or larger
+    /// than the set, or `Err(Error::NotInitialized)` if the contract has no
+    /// admin set yet.
+    ///
+    /// # Panics
+    /// Panics if the current admin does not authorize the call.
+    pub fn set_multisig_config(
+        env: Env,
+        signers: Vec<Address>,
+        threshold: u32,
+    ) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        let validated = Self::validate_multisig_config(&signers, threshold)?;
+        Self::store_multisig_config(&env, signers, validated);
+
+        env.events()
+            .publish((Symbol::new(&env, "multisig_config_set"), admin), validated);
+
+        log!(
+            &env,
+            "Multi-signature upgrade threshold set to {}",
+            validated
+        );
+        Ok(())
+    }
+
+    /// Returns the current multi-signature admin group.
+    ///
+    /// # Returns
+    /// The configured signers and threshold, or `Err(Error::MultisigNotInitialized)`
+    /// if `set_multisig_config` has not been called yet.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn get_multisig_config(env: Env) -> Result<MultisigConfig, Error> {
+        let (signers, threshold) = Self::load_multisig_config(&env)?;
+        Ok(MultisigConfig { signers, threshold })
+    }
+
+    /// Records `signer`'s authorization of an upgrade to `new_wasm_hash`.
+    ///
+    /// # Parameters
+    /// - `signer`: The group member approving; must authorize this call.
+    /// - `new_wasm_hash`: The WASM hash being approved.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or appropriate `Error` on failure.
+    pub fn approve_upgrade(
+        env: Env,
+        signer: Address,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        let (signers, threshold) = Self::load_multisig_config(&env)?;
+        if !signers.contains(&signer) {
+            return Err(Error::NotMultisigSigner);
+        }
+        signer.require_auth();
+
+        let key = DataKey::UpgradeApproval(new_wasm_hash.clone());
+        let mut approvals: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if approvals.contains(&signer) {
+            return Err(Error::AlreadyApproved);
+        }
+        approvals.push_back(signer.clone());
+        env.storage().persistent().set(&key, &approvals);
+        env.storage().persistent().extend_ttl(
+            &key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "upgrade_approved"), signer, new_wasm_hash),
+            (approvals.len(), threshold),
+        );
+
+        log!(
+            &env,
+            "Upgrade approved by signer {}/{}",
+            approvals.len(),
+            threshold
+        );
+        Ok(())
+    }
+
+    /// Withdraws a signer's previously recorded approval of an upgrade.
+    ///
+    /// Lets a signer pull its signature back before the threshold is reached,
+    /// which is the way a group stops an upgrade it no longer wants without
+    /// having to rotate the whole signer set. Idempotent: withdrawing an
+    /// approval that was never recorded is a no-op.
+    ///
+    /// # Parameters
+    /// - `signer`: The group member withdrawing its approval; must authorize
+    ///   this call.
+    /// - `new_wasm_hash`: The WASM hash to withdraw the approval for.
+    ///
+    /// # Returns
+    /// `Ok(())` on success or `Err(Error::MultisigNotInitialized)` if no group
+    /// is configured.
+    ///
+    /// # Panics
+    /// Panics if `signer` does not authorize the call.
+    pub fn revoke_upgrade_approval(
+        env: Env,
+        signer: Address,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        let (signers, _) = Self::load_multisig_config(&env)?;
+        if !signers.contains(&signer) {
+            return Err(Error::NotMultisigSigner);
+        }
+        signer.require_auth();
+
+        let key = DataKey::UpgradeApproval(new_wasm_hash.clone());
+        let mut approvals: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Vec::first_index_of returns the position of the first match, which
+        // for a duplicate-free set is the one and only approval to drop.
+        if let Some(index) = approvals.first_index_of(&signer) {
+            approvals.remove(index);
+            if approvals.is_empty() {
+                env.storage().persistent().remove(&key);
+            } else {
+                env.storage().persistent().set(&key, &approvals);
+                env.storage().persistent().extend_ttl(
+                    &key,
+                    Self::PERSISTENT_LIFETIME_THRESHOLD,
+                    Self::PERSISTENT_BUMP_AMOUNT,
+                );
+            }
+
+            env.events().publish(
+                (Symbol::new(&env, "upgrade_revoked"), signer, new_wasm_hash),
+                approvals.len(),
+            );
+
+            log!(&env, "Upgrade approval revoked");
+        }
+
+        Ok(())
+    }
+
+    /// Discards every approval collected for `new_wasm_hash`. Admin-only.
+    ///
+    /// The blunt instrument for a compromised hash: it drops the quorum even
+    /// when the threshold was already met, so the group can force the group
+    /// back to zero signatures. Note that `upgrade` is permissionless once the
+    /// threshold is met, so the admin should prefer having signers revoke their
+    /// own approvals (or rotate the group) while the hash is still in flight.
+    ///
+    /// # Parameters
+    /// - `new_wasm_hash`: The WASM hash to clear approvals for.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract has
+    /// no admin set yet. Clearing a hash with no approvals is a no-op.
+    ///
+    /// # Panics
+    /// Panics if the current admin does not authorize the call.
+    pub fn cancel_upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        let key = DataKey::UpgradeApproval(new_wasm_hash.clone());
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().remove(&key);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "upgrade_cancelled"), admin),
+            new_wasm_hash,
+        );
+
+        log!(&env, "Pending upgrade approvals cleared by admin");
+        Ok(())
+    }
+
+    /// Returns the signers whose approval of an upgrade to `new_wasm_hash`
+    /// currently counts.
+    ///
+    /// Approvals cast by a signer that has since been rotated out of the group
+    /// are omitted, so this list always agrees with `is_upgrade_authorized`.
+    ///
+    /// # Returns
+    /// The counted approvals in the order they were recorded, or an empty
+    /// vector if the hash has none. Empty when no group is configured.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn get_upgrade_approvals(env: Env, new_wasm_hash: BytesN<32>) -> Vec<Address> {
+        match Self::load_multisig_config(&env) {
+            Ok((signers, _)) => Self::load_effective_approvals(&env, &signers, &new_wasm_hash),
+            // Fail closed without erroring: a view of "who approved" is
+            // meaningless when there is no group to have authorized anything.
+            Err(_) => Vec::new(&env),
+        }
+    }
+
+    /// Returns whether an upgrade to `new_wasm_hash` is already authorized.
+    ///
+    /// # Returns
+    /// `true` once `M` group members have approved that exact hash.
+    /// `Err(Error::MultisigNotInitialized)` if no group is configured.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn is_upgrade_authorized(env: Env, new_wasm_hash: BytesN<32>) -> Result<bool, Error> {
+        Self::check_upgrade_authorized(&env, &new_wasm_hash)
+    }
+
+    // Deliberately permissionless: the M collected signatures *are* the
+    // authorization, so whoever submits the transaction once the threshold is
+    // met gets the same result, and no additional key — least of all the
+    // admin's — can stand in for a quorum. Approvals are consumed on success,
+    // so reaching the threshold authorizes exactly one installation. The same
+    // gate applies to the timelock path, so queueing an `ActionType::Upgrade`
+    // is not a way around it.
+    /// Replaces this contract's WASM with a previously uploaded version, once
+    /// the multi-signature group has authorized that exact hash.
     ///
     /// # Parameters
     /// - `new_wasm_hash`: Hash of a WASM blob previously uploaded to the
-    ///   network, to install as this contract's new executable.
+    ///   network. Must match a hash with at least `threshold` approvals.
     ///
     /// # Returns
-    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
-    /// has no admin set yet.
+    /// `Ok(())` on success, `Err(Error::MultisigNotInitialized)` if no group
+    /// is configured, or `Err(Error::InsufficientApprovals)` if fewer than
+    /// `threshold` members have approved this hash.
     ///
     /// # Panics
-    /// Panics if the current SuperAdmin does not authorize the call, or if
-    /// `new_wasm_hash` does not reference a previously uploaded WASM blob.
-    ///
-    /// DEPRECATED for direct use.  Queue via `queue_action(ActionType::Upgrade(…))`.
+    /// Panics if `new_wasm_hash` does not reference an uploaded WASM blob.
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
-        Self::require_role(&env, Role::SuperAdmin)?;
+        let approvals = Self::require_upgrade_authorized(&env, &new_wasm_hash)?;
 
-        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        Self::apply_upgrade(&env, &new_wasm_hash);
+
+        env.events().publish(
+            (Symbol::new(&env, "contract_upgraded"), new_wasm_hash),
+            approvals,
+        );
+
+        log!(
+            &env,
+            "Contract upgraded with {} multisig approvals",
+            approvals
+        );
         Ok(())
     }
 
     /// Returns the contract version.
     ///
-    /// # Returns
-    /// The contract's version number, currently `1`.
+    /// This is a read-only view function: it does not write to ledger storage
+    /// and costs only the base invocation fee.  The UI calls this before
+    /// submitting transactions to confirm it is compatible with the deployed
+    /// contract.
     ///
-    /// # Panics
-    /// Does not panic.
-    pub fn version(_env: Env) -> u32 {
-        Self::VERSION
+    /// # Returns
+    /// A [`String`] in the form `"MAJOR.MINOR.PATCH"` (e.g. `"1.0.0"`).
+    pub fn version(env: Env) -> String {
+        String::from_str(&env, Self::CONTRACT_VERSION)
     }
 }
 
@@ -3533,7 +3848,7 @@ impl PaymentRouter {
             .instance()
             .set(&DataKey::ArchiveEpoch, &new_epoch);
 
-        let record_count = leaves.len() as u32;
+        let record_count = leaves.len();
         let committed_at = env.ledger().timestamp();
 
         // Persist the Merkle root.
@@ -3670,3176 +3985,7 @@ impl PaymentRouter {
 }
 
 #[cfg(test)]
-mod test {
-    use super::*;
+mod test;
 
-    // The crate is `no_std`, but the test harness links std; pull it in so
-    // the benchmark can print its GAS REPORT lines.
-    extern crate std;
-    use soroban_sdk::{
-        testutils::{Address as _, Events, Ledger as _, LedgerInfo},
-        token::StellarAssetClient,
-        Address, Env, Symbol, TryIntoVal,
-    };
-
-    #[contracttype]
-    #[derive(Clone)]
-    enum MockLendingKey {
-        Principal(Address),
-        Yield(Address),
-    }
-
-    #[contract]
-    struct MockLendingProtocol;
-
-    #[contractimpl]
-    impl MockLendingProtocol {
-        pub fn deposit(env: Env, from: Address, token: Address, amount: i128) {
-            from.require_auth();
-            token::Client::new(&env, &token).transfer(
-                &from,
-                &env.current_contract_address(),
-                &amount,
-            );
-            let key = MockLendingKey::Principal(token);
-            let current: i128 = env.storage().instance().get(&key).unwrap_or(0);
-            env.storage().instance().set(&key, &(current + amount));
-        }
-
-        pub fn withdraw(env: Env, to: Address, token: Address, amount: i128) {
-            let key = MockLendingKey::Principal(token.clone());
-            let current: i128 = env.storage().instance().get(&key).unwrap_or(0);
-            assert!(current >= amount);
-            token::Client::new(&env, &token).transfer(
-                &env.current_contract_address(),
-                &to,
-                &amount,
-            );
-            env.storage().instance().set(&key, &(current - amount));
-        }
-
-        pub fn harvest(env: Env, to: Address, token: Address) -> i128 {
-            let key = MockLendingKey::Yield(token.clone());
-            let amount: i128 = env.storage().instance().get(&key).unwrap_or(0);
-            if amount > 0 {
-                token::Client::new(&env, &token).transfer(
-                    &env.current_contract_address(),
-                    &to,
-                    &amount,
-                );
-                env.storage().instance().remove(&key);
-            }
-            amount
-        }
-
-        pub fn accrue_yield(env: Env, token: Address, amount: i128) {
-            let key = MockLendingKey::Yield(token);
-            let current: i128 = env.storage().instance().get(&key).unwrap_or(0);
-            env.storage().instance().set(&key, &(current + amount));
-        }
-    }
-
-    #[contracttype]
-    #[derive(Clone)]
-    enum MockKycKey {
-        Verified(Address),
-    }
-
-    #[contract]
-    struct MockKycOracle;
-
-    #[contractimpl]
-    impl MockKycOracle {
-        pub fn set_verified(env: Env, account: Address, verified: bool) {
-            env.storage()
-                .instance()
-                .set(&MockKycKey::Verified(account), &verified);
-        }
-
-        pub fn is_verified(env: Env, account: Address) -> bool {
-            env.storage()
-                .instance()
-                .get(&MockKycKey::Verified(account))
-                .unwrap_or(false)
-        }
-    }
-
-    // ── Mock price-feed oracle ───────────────────────────────────────────────
-
-    #[contracttype]
-    #[derive(Clone)]
-    enum MockOracleKey {
-        Price(Address, Address),
-        ShouldFail,
-    }
-
-    #[contracterror]
-    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-    #[repr(u32)]
-    pub enum MockOracleError {
-        /// Simulates an unavailable oracle.
-        Unavailable = 1,
-    }
-
-    #[contract]
-    struct MockPriceFeedOracle;
-
-    #[contractimpl]
-    impl MockPriceFeedOracle {
-        /// Store a price for a given (base, quote) pair.
-        pub fn set_price(
-            env: Env,
-            base_asset: Address,
-            quote_asset: Address,
-            price: i128,
-            decimals: u32,
-            timestamp: u64,
-        ) {
-            let data = PriceData {
-                price,
-                decimals,
-                timestamp,
-            };
-            env.storage()
-                .instance()
-                .set(&MockOracleKey::Price(base_asset, quote_asset), &data);
-        }
-
-        /// Configure the mock to trap on the next `get_price` call.
-        pub fn set_should_fail(env: Env, fail: bool) {
-            env.storage()
-                .instance()
-                .set(&MockOracleKey::ShouldFail, &fail);
-        }
-
-        /// Implements the PriceFeedOracle interface.
-        pub fn get_price(
-            env: Env,
-            base_asset: Address,
-            quote_asset: Address,
-        ) -> Result<PriceData, MockOracleError> {
-            let should_fail: bool = env
-                .storage()
-                .instance()
-                .get(&MockOracleKey::ShouldFail)
-                .unwrap_or(false);
-            if should_fail {
-                return Err(MockOracleError::Unavailable);
-            }
-            Ok(env
-                .storage()
-                .instance()
-                .get(&MockOracleKey::Price(base_asset, quote_asset))
-                .unwrap_or(PriceData {
-                    price: 0,
-                    decimals: 7,
-                    timestamp: 0,
-                }))
-        }
-    }
-
-    // ── Oracle helper ────────────────────────────────────────────────────────
-
-    fn setup_oracle_env() -> (
-        Env,
-        PaymentRouterClient<'static>,
-        Address,
-        MockPriceFeedOracleClient<'static>,
-        Address,
-        Address,
-        Address,
-    ) {
-        let env = Env::default();
-        env.mock_all_auths();
-        // The ledger starts at timestamp 0, which `get_price` treats as a
-        // stale quote. Start from a realistic time so "fresh" prices are
-        // actually fresh.
-        env.ledger().set(LedgerInfo {
-            timestamp: 1_000_000,
-            protocol_version: env.ledger().protocol_version(),
-            sequence_number: env.ledger().sequence(),
-            network_id: env.ledger().network_id().into(),
-            base_reserve: 100,
-            min_temp_entry_ttl: 16,
-            min_persistent_entry_ttl: 4096,
-            max_entry_ttl: 6312000,
-        });
-        let contract_id = env.register_contract(None, PaymentRouter);
-        let client = PaymentRouterClient::new(&env, &contract_id);
-        let oracle_id = env.register_contract(None, MockPriceFeedOracle);
-        let oracle_client = MockPriceFeedOracleClient::new(&env, &oracle_id);
-        let base = Address::generate(&env);
-        let quote = Address::generate(&env);
-        (
-            env,
-            client,
-            contract_id,
-            oracle_client,
-            oracle_id,
-            base,
-            quote,
-        )
-    }
-
-    // ── Oracle tests ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_get_price_returns_valid_oracle_price() {
-        let (env, client, _, oracle_client, oracle_id, base, quote) = setup_oracle_env();
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
-        client.set_price_oracle(&oracle_id);
-
-        // Populate mock: 0.125 USD/XLM with 7 decimals = 1_250_000, fresh timestamp
-        let now = env.ledger().timestamp();
-        oracle_client.set_price(&base, &quote, &1_250_000, &7, &now);
-
-        let price_data = client.get_price(&base, &quote);
-        assert_eq!(price_data.price, 1_250_000);
-        assert_eq!(price_data.decimals, 7);
-        assert_eq!(price_data.timestamp, now);
-    }
-
-    #[test]
-    fn test_get_price_fails_when_oracle_not_configured() {
-        let (env, client, _, _oracle_client, _oracle_id, base, quote) = setup_oracle_env();
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
-
-        // No oracle set, no fallback
-        assert_eq!(
-            client.try_get_price(&base, &quote),
-            Err(Ok(Error::OracleNotConfigured))
-        );
-    }
-
-    #[test]
-    fn test_get_price_uses_fallback_when_oracle_not_configured() {
-        let (env, client, _, _oracle_client, _oracle_id, base, quote) = setup_oracle_env();
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
-
-        // Set a fallback price but no live oracle
-        client.set_fallback_price(&base, &quote, &1_000_000, &7);
-
-        let fallback = client.get_fallback_price(&base, &quote);
-        assert!(fallback.is_some());
-        assert_eq!(fallback.unwrap().price, 1_000_000);
-
-        // get_price should return the fallback
-        let result = client.get_price(&base, &quote);
-        assert_eq!(result.price, 1_000_000);
-    }
-
-    #[test]
-    fn test_get_price_rejects_stale_data_and_uses_fallback() {
-        let (env, client, _, oracle_client, oracle_id, base, quote) = setup_oracle_env();
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
-        client.set_price_oracle(&oracle_id);
-        // Threshold of 3600 seconds (default)
-        client.set_staleness_threshold(&3_600u64);
-
-        // Oracle returns a price with a very old timestamp (2 hours ago)
-        let stale_timestamp = env.ledger().timestamp().saturating_sub(7_200);
-        oracle_client.set_price(&base, &quote, &2_000_000, &7, &stale_timestamp);
-
-        // Without fallback: should return OraclePriceStale
-        assert_eq!(
-            client.try_get_price(&base, &quote),
-            Err(Ok(Error::OraclePriceStale))
-        );
-
-        // Add a fallback: should now return the fallback price
-        client.set_fallback_price(&base, &quote, &1_800_000, &7);
-        let result = client.get_price(&base, &quote);
-        assert_eq!(result.price, 1_800_000);
-    }
-
-    #[test]
-    fn test_get_price_rejects_invalid_price() {
-        let (env, client, _, oracle_client, oracle_id, base, quote) = setup_oracle_env();
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
-        client.set_price_oracle(&oracle_id);
-
-        // Oracle returns price = 0 with a fresh timestamp
-        let now = env.ledger().timestamp();
-        oracle_client.set_price(&base, &quote, &0, &7, &now);
-
-        assert_eq!(
-            client.try_get_price(&base, &quote),
-            Err(Ok(Error::OraclePriceInvalid))
-        );
-    }
-
-    #[test]
-    fn test_get_price_falls_back_when_oracle_call_fails() {
-        let (env, client, _, oracle_client, oracle_id, base, quote) = setup_oracle_env();
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
-        client.set_price_oracle(&oracle_id);
-
-        // Configure mock to fail
-        oracle_client.set_should_fail(&true);
-
-        // No fallback: should error
-        assert_eq!(
-            client.try_get_price(&base, &quote),
-            Err(Ok(Error::OracleCallFailed))
-        );
-
-        // With fallback configured: should succeed
-        client.set_fallback_price(&base, &quote, &5_000_000, &7);
-        let result = client.get_price(&base, &quote);
-        assert_eq!(result.price, 5_000_000);
-    }
-
-    #[test]
-    fn test_staleness_threshold_zero_disables_staleness_check() {
-        let (env, client, _, oracle_client, oracle_id, base, quote) = setup_oracle_env();
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
-        client.set_price_oracle(&oracle_id);
-        // Set threshold to 0 = staleness check disabled
-        client.set_staleness_threshold(&0u64);
-
-        // Oracle returns a price with timestamp 0 (would normally be stale)
-        oracle_client.set_price(&base, &quote, &3_000_000, &7, &0);
-
-        // Should pass because staleness check is disabled
-        let result = client.get_price(&base, &quote);
-        assert_eq!(result.price, 3_000_000);
-    }
-
-    #[test]
-    fn test_set_fallback_price_zero_clears_fallback() {
-        let (env, client, _, _oracle_client, _oracle_id, base, quote) = setup_oracle_env();
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
-
-        // Set then clear fallback
-        client.set_fallback_price(&base, &quote, &1_000_000, &7);
-        assert!(client.get_fallback_price(&base, &quote).is_some());
-
-        client.set_fallback_price(&base, &quote, &0, &7);
-        assert!(client.get_fallback_price(&base, &quote).is_none());
-    }
-
-    #[test]
-    fn test_set_price_oracle_requires_compliance_officer_role() {
-        let (env, client, _, _oracle_client, oracle_id, _base, _quote) = setup_oracle_env();
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
-
-        // Only ComplianceOfficer (admin in this test via mock_all_auths) can set the oracle.
-        // Verify auth is recorded for admin.
-        client.set_price_oracle(&oracle_id);
-        let auths = env.auths();
-        let admin_auth_present = auths.iter().any(|(addr, _)| *addr == admin);
-        assert!(
-            admin_auth_present,
-            "set_price_oracle must require admin/ComplianceOfficer authorization"
-        );
-    }
-
-    /// Returns (env, client, contract_id).
-    fn setup_env() -> (Env, PaymentRouterClient<'static>, Address) {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register_contract(None, PaymentRouter);
-        let client = PaymentRouterClient::new(&env, &contract_id);
-        (env, client, contract_id)
-    }
-
-    /// Deploys a Stellar Asset Contract test token. Returns
-    /// (token_address, token_client, stellar_asset_admin_client).
-    fn setup_token(
-        env: &Env,
-    ) -> (
-        Address,
-        token::Client<'static>,
-        token::StellarAssetClient<'static>,
-    ) {
-        let token_admin = Address::generate(env);
-        let token_address = env.register_stellar_asset_contract(token_admin);
-        let token_client = token::Client::new(env, &token_address);
-        let token_admin_client = token::StellarAssetClient::new(env, &token_address);
-        (token_address, token_client, token_admin_client)
-    }
-
-    // ── Timelock tests ───────────────────────────────────────────────────────
-
-    #[test]
-    fn test_treasury_yield_deposit_harvest_and_withdraw() {
-        let (env, client, _contract_id) = setup_env();
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let protocol_id = env.register_contract(None, MockLendingProtocol);
-        let protocol_client = MockLendingProtocolClient::new(&env, &protocol_id);
-        let (token_address, token_client, token_admin_client) = setup_token(&env);
-
-        client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
-        client.set_yield_protocol(&protocol_id);
-        token_admin_client.mint(&treasury, &10_000);
-
-        client.deposit_to_yield(&token_address, &6_000);
-        assert_eq!(client.get_yield_position(&token_address), 6_000);
-        assert_eq!(token_client.balance(&treasury), 4_000);
-        assert_eq!(token_client.balance(&protocol_id), 6_000);
-
-        token_admin_client.mint(&protocol_id, &500);
-        protocol_client.accrue_yield(&token_address, &500);
-        assert_eq!(client.harvest_yield(&token_address), 500);
-        assert_eq!(token_client.balance(&treasury), 4_500);
-        assert_eq!(client.get_yield_position(&token_address), 6_000);
-
-        client.withdraw_from_yield(&token_address, &2_000);
-        assert_eq!(client.get_yield_position(&token_address), 4_000);
-        assert_eq!(token_client.balance(&treasury), 6_500);
-        assert_eq!(token_client.balance(&protocol_id), 4_000);
-    }
-
-    #[test]
-    fn test_yield_operations_require_configuration_and_valid_amounts() {
-        let (env, client, _contract_id) = setup_env();
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let (token_address, _token_client, _token_admin_client) = setup_token(&env);
-        client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
-
-        assert_eq!(
-            client.try_deposit_to_yield(&token_address, &100),
-            Err(Ok(Error::YieldProtocolNotConfigured))
-        );
-        assert_eq!(
-            client.try_deposit_to_yield(&token_address, &0),
-            Err(Ok(Error::InvalidYieldAmount))
-        );
-        assert_eq!(
-            client.try_withdraw_from_yield(&token_address, &1),
-            Err(Ok(Error::InvalidYieldAmount))
-        );
-    }
-
-    #[test]
-    fn test_kyc_oracle_gates_only_high_value_payments() {
-        let (env, client, _contract_id) = setup_env();
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-        let oracle_id = env.register_contract(None, MockKycOracle);
-        let oracle_client = MockKycOracleClient::new(&env, &oracle_id);
-        let (token_address, token_client, token_admin_client) = setup_token(&env);
-
-        client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
-        client.set_kyc_config(&oracle_id, &1_000);
-        token_admin_client.mint(&sender, &10_000);
-
-        client.route_payment(&sender, &recipient, &token_address, &500);
-        assert_eq!(
-            client.try_route_payment(&sender, &recipient, &token_address, &2_000),
-            Err(Ok(Error::KycRequired))
-        );
-
-        oracle_client.set_verified(&sender, &true);
-        client.route_payment(&sender, &recipient, &token_address, &2_000);
-        assert_eq!(client.get_kyc_threshold(), Some(1_000));
-        assert_eq!(token_client.balance(&sender), 7_500);
-    }
-
-    #[test]
-    fn test_kyc_config_rejects_negative_threshold() {
-        let (env, client, _contract_id) = setup_env();
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let oracle = Address::generate(&env);
-        client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
-
-        assert_eq!(
-            client.try_set_kyc_config(&oracle, &-1),
-            Err(Ok(Error::InvalidKycThreshold))
-        );
-    }
-
-    #[test]
-    fn test_batch_payments_enforce_kyc_for_each_sender() {
-        let (env, client, _contract_id) = setup_env();
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-        let oracle_id = env.register_contract(None, MockKycOracle);
-        let (token_address, _token_client, token_admin_client) = setup_token(&env);
-        client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
-        client.set_kyc_config(&oracle_id, &1_000);
-        token_admin_client.mint(&sender, &5_000);
-
-        let payments = Vec::from_array(
-            &env,
-            [Payment {
-                sender,
-                recipient,
-                token_address,
-                amount: 2_000,
-            }],
-        );
-        assert_eq!(
-            client.try_route_payments(&payments),
-            Err(Ok(Error::KycRequired))
-        );
-    }
-
-    #[test]
-    fn test_queue_and_execute_set_fee_bps_after_delay() {
-        let (env, client, _) = setup_env();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
-
-        // Queue a fee-bps change.
-        let nonce = client.queue_action(&ActionType::SetFeeBps(250));
-        assert_eq!(nonce, 1);
-        assert_eq!(client.get_fee(), 100); // Not applied yet.
-
-        // Trying to execute immediately should fail (delay not elapsed).
-        let res = client.try_execute_action(&nonce);
-        assert_eq!(res.unwrap_err().unwrap(), Error::TimelockNotReady);
-
-        // Advance time past 24 hours.
-        let current_time = env.ledger().timestamp();
-        env.ledger().set(LedgerInfo {
-            timestamp: current_time + PaymentRouter::SECONDS_IN_24H + 1,
-            protocol_version: env.ledger().protocol_version(),
-            sequence_number: env.ledger().sequence(),
-            network_id: env.ledger().network_id().into(),
-            base_reserve: 100,
-            min_temp_entry_ttl: 16,
-            min_persistent_entry_ttl: 4096,
-            max_entry_ttl: 6312000,
-        });
-
-        // Now execution should succeed.
-        client.execute_action(&nonce);
-        assert_eq!(client.get_fee(), 250);
-
-        // Entry should be gone.
-        let res = client.try_get_queued_action(&nonce);
-        assert_eq!(res.unwrap_err().unwrap(), Error::TimelockNotFound);
-    }
-
-    #[test]
-    fn test_queue_and_execute_set_platform_treasury() {
-        let (env, client, _) = setup_env();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let new_treasury = Address::generate(&env);
-        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
-
-        let nonce = client.queue_action(&ActionType::SetPlatformTreasury(new_treasury.clone()));
-
-        // Advance 24h+.
-        let ts = env.ledger().timestamp();
-        env.ledger().set(LedgerInfo {
-            timestamp: ts + PaymentRouter::SECONDS_IN_24H + 1,
-            protocol_version: env.ledger().protocol_version(),
-            sequence_number: env.ledger().sequence(),
-            network_id: env.ledger().network_id().into(),
-            base_reserve: 100,
-            min_temp_entry_ttl: 16,
-            min_persistent_entry_ttl: 4096,
-            max_entry_ttl: 6312000,
-        });
-
-        client.execute_action(&nonce);
-
-        // Verify the treasury was actually updated by routing a payment and
-        // checking where the fee lands.
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-        let (token_addr, token_client, sac) = setup_token(&env);
-        sac.mint(&sender, &10_000);
-        client.route_payment(&sender, &recipient, &token_addr, &1000);
-
-        // 100 bps of 1000 = 10, capped to min(10, 1000) = 10
-        assert_eq!(token_client.balance(&new_treasury), 10);
-        assert_eq!(token_client.balance(&treasury), 0);
-    }
-
-    #[test]
-    fn test_execute_action_not_found() {
-        let (env, client, _) = setup_env();
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
-
-        let res = client.try_execute_action(&99u64);
-        assert_eq!(res.unwrap_err().unwrap(), Error::TimelockNotFound);
-    }
-
-    #[test]
-    fn test_cancel_action() {
-        let (env, client, _) = setup_env();
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
-
-        let nonce = client.queue_action(&ActionType::SetFeeBps(999));
-        assert!(client.try_get_queued_action(&nonce).is_ok());
-
-        client.cancel_action(&nonce);
-
-        // Entry should be gone.
-        let res = client.try_get_queued_action(&nonce);
-        assert_eq!(res.unwrap_err().unwrap(), Error::TimelockNotFound);
-
-        // Fee should remain unchanged.
-        assert_eq!(client.get_fee(), 100);
-    }
-
-    #[test]
-    fn test_cancel_nonexistent_action() {
-        let (env, client, _) = setup_env();
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
-
-        let res = client.try_cancel_action(&42u64);
-        assert_eq!(res.unwrap_err().unwrap(), Error::TimelockNotFound);
-    }
-
-    #[test]
-    fn test_nonce_increments() {
-        let (env, client, _) = setup_env();
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
-
-        let n1 = client.queue_action(&ActionType::SetFeeBps(200));
-        let n2 = client.queue_action(&ActionType::SetFeeBps(300));
-        let n3 = client.queue_action(&ActionType::SetFeeBps(400));
-
-        assert_eq!(n1, 1);
-        assert_eq!(n2, 2);
-        assert_eq!(n3, 3);
-    }
-
-    // ── Freeze tests ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_emergency_freeze_blocks_payments() {
-        let (env, client, _) = setup_env();
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-
-        let (token_address, _token_client, sac) = setup_token(&env);
-        sac.mint(&sender, &10_000);
-
-        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
-
-        assert!(!client.is_frozen());
-
-        client.emergency_freeze();
-        assert!(client.is_frozen());
-
-        let res = client.try_route_payment(&sender, &recipient, &token_address, &1000);
-        assert_eq!(res.unwrap_err().unwrap(), Error::ContractFrozen);
-    }
-
-    #[test]
-    fn test_emergency_freeze_blocks_timelock_execution() {
-        let (env, client, _) = setup_env();
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
-
-        let nonce = client.queue_action(&ActionType::SetFeeBps(500));
-
-        // Advance past 24h.
-        let ts = env.ledger().timestamp();
-        env.ledger().set(LedgerInfo {
-            timestamp: ts + PaymentRouter::SECONDS_IN_24H + 1,
-            protocol_version: env.ledger().protocol_version(),
-            sequence_number: env.ledger().sequence(),
-            network_id: env.ledger().network_id().into(),
-            base_reserve: 100,
-            min_temp_entry_ttl: 16,
-            min_persistent_entry_ttl: 4096,
-            max_entry_ttl: 6312000,
-        });
-
-        // Freeze the contract before execution.
-        client.emergency_freeze();
-
-        let res = client.try_execute_action(&nonce);
-        assert_eq!(res.unwrap_err().unwrap(), Error::ContractFrozen);
-
-        // Fee remains unchanged.
-        assert_eq!(client.get_fee(), 100);
-    }
-
-    #[test]
-    fn test_unfreeze_restores_payments() {
-        let (env, client, _) = setup_env();
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-
-        let (token_address, _token_client, sac) = setup_token(&env);
-        sac.mint(&sender, &10_000);
-
-        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
-
-        client.emergency_freeze();
-        assert!(client.is_frozen());
-
-        client.unfreeze();
-        assert!(!client.is_frozen());
-
-        // Payments should work again.
-        client.route_payment(&sender, &recipient, &token_address, &1000);
-    }
-
-    #[test]
-    fn test_freeze_queue_action_blocked() {
-        let (env, client, _) = setup_env();
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
-
-        client.emergency_freeze();
-
-        // Cannot queue new actions while frozen.
-        let res = client.try_queue_action(&ActionType::SetFeeBps(500));
-        assert_eq!(res.unwrap_err().unwrap(), Error::ContractFrozen);
-    }
-
-    #[test]
-    fn test_cancel_action_allowed_while_frozen() {
-        let (env, client, _) = setup_env();
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
-
-        // Queue an action before freezing.
-        let nonce = client.queue_action(&ActionType::SetFeeBps(500));
-
-        client.emergency_freeze();
-
-        // Cancellation should still be possible while frozen (incident response).
-        client.cancel_action(&nonce);
-        let res = client.try_get_queued_action(&nonce);
-        assert_eq!(res.unwrap_err().unwrap(), Error::TimelockNotFound);
-    }
-
-    // ── Timelock emits events ────────────────────────────────────────────────
-
-    #[test]
-    fn test_queue_action_emits_event() {
-        let (env, client, _) = setup_env();
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
-
-        client.queue_action(&ActionType::SetFeeBps(200));
-
-        let events = env.events().all();
-        let found = events.iter().any(|(_, topics, _)| {
-            if topics.is_empty() {
-                return false;
-            }
-            let raw = topics.get(0).unwrap();
-            let sym: Result<Symbol, _> = raw.try_into_val(&env);
-            sym.map(|s| s == Symbol::new(&env, "action_queued"))
-                .unwrap_or(false)
-        });
-        assert!(found, "action_queued event not found");
-    }
-
-    #[test]
-    fn test_freeze_emits_event() {
-        let (env, client, _) = setup_env();
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
-
-        client.emergency_freeze();
-
-        let events = env.events().all();
-        let found = events.iter().any(|(_, topics, _)| {
-            if topics.is_empty() {
-                return false;
-            }
-            let raw = topics.get(0).unwrap();
-            let sym: Result<Symbol, _> = raw.try_into_val(&env);
-            sym.map(|s| s == Symbol::new(&env, "emergency_freeze"))
-                .unwrap_or(false)
-        });
-        assert!(found, "emergency_freeze event not found");
-    }
-
-    // ── Original tests (retained) ────────────────────────────────────────────
-
-    #[test]
-    fn test_get_fee() {
-        let (env, client, _) = setup_env();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-
-        // Before initialization, get_fee returns 0
-        assert_eq!(client.get_fee(), 0);
-
-        // Initialize with 150 bps
-        client.initialize(&admin, &treasury, &150, &5000, &PaymentRouter::MAX_AMOUNT);
-        assert_eq!(client.get_fee(), 150);
-
-        // Update via set_fee_bps
-        client.set_fee_bps(&250);
-        assert_eq!(client.get_fee(), 250);
-
-        // Update via set_fee_config
-        client.set_fee_config(&300, &10000);
-        assert_eq!(client.get_fee(), 300);
-    }
-
-    #[test]
-    fn test_version_reports_contract_version() {
-        let (_env, client, _) = setup_env();
-
-        // #269 — the version view is callable without initialization and
-        // returns the compiled-in contract version so a UI can check
-        // compatibility before interacting with the contract.
-        assert_eq!(client.version(), PaymentRouter::VERSION);
-        assert_eq!(client.version(), 1);
-    }
-
-    #[test]
-    fn test_admin_restrictions_and_updates() {
-        let (env, client, _) = setup_env();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let new_admin = Address::generate(&env);
-
-        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
-
-        // Trying to initialize again should fail
-        let res = client.try_initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
-        assert_eq!(res.unwrap_err().unwrap(), Error::AlreadyInitialized);
-
-        client.set_admin(&new_admin);
-
-        // Modify config
-        client.set_fee_config(&200, &2000);
-        client.set_fee_bps(&200);
-        assert_eq!(client.get_fee(), 200);
-
-        let new_treasury = Address::generate(&env);
-        client.set_platform_treasury(&new_treasury);
-    }
-
-    #[test]
-    fn test_recover_tokens() {
-        let (env, client, contract_id) = setup_env();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-
-        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
-
-        let (token_address, token_client, stellar_asset_client) = setup_token(&env);
-
-        // Simulate tokens accidentally sent directly to the contract address
-        let accidental_amount = 5_000i128;
-        stellar_asset_client.mint(&contract_id, &accidental_amount);
-
-        assert_eq!(token_client.balance(&contract_id), accidental_amount);
-        assert_eq!(token_client.balance(&admin), 0);
-
-        // Admin recovers tokens
-        let recover_amount = 3_000i128;
-        client.recover_tokens(&token_address, &recover_amount);
-
-        assert_eq!(token_client.balance(&admin), recover_amount);
-        assert_eq!(
-            token_client.balance(&contract_id),
-            accidental_amount - recover_amount
-        );
-    }
-
-    #[test]
-    fn test_set_pause_emits_event() {
-        let (env, client, _) = setup_env();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-
-        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
-
-        client.set_pause(&true);
-
-        let events = env.events().all();
-        assert!(!events.is_empty());
-        let (_, topics, _) = events.get(0).unwrap();
-        assert_eq!(topics.len(), 1);
-        let topic: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
-        assert_eq!(topic, symbol_short!("pause"));
-    }
-
-    #[test]
-    fn test_route_payment_emits_payment_initiated_event() {
-        let (env, client, _) = setup_env();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-
-        let (token_address, _token_client, sac) = setup_token(&env);
-        sac.mint(&sender, &10_000);
-
-        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
-
-        client
-            .mock_all_auths()
-            .route_payment(&sender, &recipient, &token_address, &5_000);
-
-        let events = env.events().all();
-        assert!(!events.is_empty());
-
-        let mut found = false;
-        for (_, topics, data) in events.iter() {
-            if !topics.is_empty() {
-                if let Ok(topic_sym) = topics.get(0).unwrap().try_into_val(&env) {
-                    let sym: Symbol = topic_sym;
-                    if sym == Symbol::new(&env, "payment_initiated") {
-                        found = true;
-                        let amt: i128 = data.try_into_val(&env).unwrap();
-                        assert_eq!(amt, 5_000);
-                        break;
-                    }
-                }
-            }
-        }
-        assert!(found, "payment_initiated event not found");
-    }
-
-    #[test]
-    fn test_route_payment_emits_routed_event() {
-        let (env, client, _) = setup_env();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-
-        let (token_address, _token_client, _token_admin_client) = setup_token(&env);
-        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
-        sac.mint(&sender, &10_000);
-
-        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
-        client.add_supported_token(&token_address);
-
-        let amount = 2_000i128;
-        client.route_payment(&sender, &recipient, &token_address, &amount);
-
-        let events = env.events().all();
-        assert!(!events.is_empty());
-
-        // Find the "routed" event by topic
-        let mut found = None;
-        for evt in events.iter() {
-            let (_contract_id, topics, _data) = evt.clone();
-            if topics.len() != 3 {
-                continue;
-            }
-            let topic0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
-            if topic0 == symbol_short!("routed") {
-                found = Some(evt.clone());
-                break;
-            }
-        }
-        let routed = found.expect("route_payment should publish a \"routed\" event");
-
-        let (_contract_id, topics, data) = routed;
-        assert_eq!(topics.len(), 3);
-
-        let topic_sender: Address = topics.get(1).unwrap().try_into_val(&env).unwrap();
-        let topic_recipient: Address = topics.get(2).unwrap().try_into_val(&env).unwrap();
-        assert_eq!(topic_sender, sender);
-        assert_eq!(topic_recipient, recipient);
-
-        let event_amount: i128 = data.try_into_val(&env).unwrap();
-        assert_eq!(event_amount, amount);
-    }
-
-    #[test]
-    fn test_admin_pause_functionality() {
-        let (env, client, _) = setup_env();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-
-        let (token_address, _token_client, _token_admin_client) = setup_token(&env);
-        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
-        sac.mint(&sender, &10_000);
-
-        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
-
-        // Initially not paused
-        assert!(!client.is_paused());
-
-        // Pause
-        client.set_pause(&true);
-        assert!(client.is_paused());
-
-        // Route payment should fail when paused
-        let res = client.try_route_payment(&sender, &recipient, &token_address, &1000);
-        assert_eq!(res.unwrap_err().unwrap(), Error::Paused);
-
-        // Unpause via set_paused alias
-        client.set_paused(&false);
-        assert!(!client.is_paused());
-
-        // Route payment should succeed now
-        client.route_payment(&sender, &recipient, &token_address, &1000);
-    }
-
-    // ── Circuit breaker tests ────────────────────────────────────────────────
-
-    /// While the breaker is open, non-essential state changes — payments,
-    /// timelock queuing and the direct parameter setters — are rejected with
-    /// `Error::Paused`.
-    #[test]
-    fn test_circuit_breaker_blocks_non_essential_state_changes() {
-        let (env, client, _) = setup_env();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
-
-        client.set_pause(&true);
-        assert!(client.is_paused());
-
-        // Timelock state changes are blocked.
-        assert_eq!(
-            client.try_queue_action(&ActionType::SetFeeBps(250)),
-            Err(Ok(Error::Paused))
-        );
-
-        // Direct parameter setters are blocked.
-        assert_eq!(client.try_set_fee_bps(&250), Err(Ok(Error::Paused)));
-        assert_eq!(
-            client.try_set_fee_config(&250, &1000),
-            Err(Ok(Error::Paused))
-        );
-        assert_eq!(client.try_set_min_limit(&50), Err(Ok(Error::Paused)));
-        let new_treasury = Address::generate(&env);
-        assert_eq!(
-            client.try_set_platform_treasury(&new_treasury),
-            Err(Ok(Error::Paused))
-        );
-        let gov = Address::generate(&env);
-        assert_eq!(client.try_set_governance(&gov), Err(Ok(Error::Paused)));
-
-        let (token_address, _token_client, _sac) = setup_token(&env);
-        assert_eq!(
-            client.try_recover_tokens(&token_address, &10),
-            Err(Ok(Error::Paused))
-        );
-
-        // Routing stays blocked too.
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-        assert_eq!(
-            client.try_route_payment(&sender, &recipient, &token_address, &10),
-            Err(Ok(Error::Paused))
-        );
-    }
-
-    /// A queued action cannot be executed while the breaker is open, but it can
-    /// still be cancelled so the timelock queue is never stuck.
-    #[test]
-    fn test_circuit_breaker_blocks_execution_but_allows_cancel() {
-        let (env, client, _) = setup_env();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
-
-        let nonce = client.queue_action(&ActionType::SetFeeBps(250));
-
-        // Advance past the 24h timelock window.
-        let ts = env.ledger().timestamp();
-        env.ledger().set(LedgerInfo {
-            timestamp: ts + PaymentRouter::SECONDS_IN_24H + 1,
-            protocol_version: env.ledger().protocol_version(),
-            sequence_number: env.ledger().sequence(),
-            network_id: env.ledger().network_id().into(),
-            base_reserve: 100,
-            min_temp_entry_ttl: 16,
-            min_persistent_entry_ttl: 4096,
-            max_entry_ttl: 6312000,
-        });
-
-        // Open the breaker before execution: the change is not applied.
-        client.set_pause(&true);
-        assert_eq!(client.try_execute_action(&nonce), Err(Ok(Error::Paused)));
-        assert_eq!(client.get_fee(), 100);
-
-        // Cancelling the queued action remains available while paused.
-        client.cancel_action(&nonce);
-        assert_eq!(
-            client.try_get_queued_action(&nonce).unwrap_err().unwrap(),
-            Error::TimelockNotFound
-        );
-    }
-
-    /// Essential recovery paths stay callable while the breaker is open:
-    /// user refunds, emergency withdrawals and resetting the breaker.
-    #[test]
-    fn test_circuit_breaker_keeps_essential_operations_available() {
-        let (env, client, contract_id) = setup_env();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let user = Address::generate(&env);
-        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
-
-        let (token_address, token_client, stellar_asset_client) = setup_token(&env);
-
-        // Seed a refund balance and some stranded tokens for the emergency path.
-        let refund_amount = 3_000i128;
-        let stranded_amount = 2_000i128;
-        stellar_asset_client.mint(&contract_id, &(refund_amount + stranded_amount));
-        env.as_contract(&contract_id, || {
-            PaymentRouter::credit_refund_balance(&env, &user, &token_address, refund_amount);
-        });
-
-        client.set_pause(&true);
-
-        // Users can still withdraw their own refunded funds.
-        client.withdraw_refund(&user, &token_address, &1_000);
-        assert_eq!(token_client.balance(&user), 1_000);
-
-        // Emergency withdrawal of stranded funds stays available.
-        client.emergency_withdraw(&token_address, &stranded_amount);
-        assert_eq!(token_client.balance(&admin), stranded_amount);
-
-        // The breaker can always be reset.
-        client.set_pause(&false);
-        assert!(!client.is_paused());
-    }
-
-    /// Treasury yield movements are non-essential and are blocked while paused.
-    #[test]
-    fn test_circuit_breaker_blocks_yield_movements() {
-        let (env, client, _) = setup_env();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let protocol_id = env.register_contract(None, MockLendingProtocol);
-        let (token_address, _token_client, _sac) = setup_token(&env);
-
-        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
-        client.set_yield_protocol(&protocol_id);
-
-        client.set_pause(&true);
-        assert_eq!(
-            client.try_deposit_to_yield(&token_address, &100),
-            Err(Ok(Error::Paused))
-        );
-        assert_eq!(
-            client.try_harvest_yield(&token_address),
-            Err(Ok(Error::Paused))
-        );
-        assert_eq!(
-            client.try_withdraw_from_yield(&token_address, &50),
-            Err(Ok(Error::Paused))
-        );
-    }
-
-    #[test]
-    fn test_route_payment_calculates_and_sends_fee() {
-        let (env, client, _) = setup_env();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-
-        let (token_address, token_client, _token_admin_client) = setup_token(&env);
-
-        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
-        let initial_balance = 10_000i128;
-        sac.mint(&sender, &initial_balance);
-
-        // Initialize router with 1% fee (100 bps) and cap of 50
-        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
-        client.add_supported_token(&token_address);
-
-        // Test normal fee calculation: 1% of 2000 = 20, below cap of 50
-        let amount_1 = 2000i128;
-        client.route_payment(&sender, &recipient, &token_address, &amount_1);
-
-        assert_eq!(token_client.balance(&treasury), 20);
-        assert_eq!(token_client.balance(&recipient), 1980);
-        assert_eq!(token_client.balance(&sender), initial_balance - amount_1);
-        assert_eq!(client.get_user_volume(&sender), amount_1);
-
-        // Test fee capped at 50: 1% of 8000 = 80, capped to 50
-        let amount_2 = 8000i128;
-        client.route_payment(&sender, &recipient, &token_address, &amount_2);
-
-        assert_eq!(token_client.balance(&treasury), 70);
-        assert_eq!(token_client.balance(&recipient), 9930);
-        assert_eq!(
-            token_client.balance(&sender),
-            initial_balance - amount_1 - amount_2
-        );
-        assert_eq!(client.get_user_volume(&sender), amount_1 + amount_2);
-    }
-
-    #[test]
-    fn test_insufficient_balance() {
-        let (env, client, _) = setup_env();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-
-        let (token_address, _token_client, sac) = setup_token(&env);
-        sac.mint(&sender, &100);
-
-        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
-        client.add_supported_token(&token_address);
-
-        // Route payment of 500 when balance is only 100
-        let res = client.try_route_payment(&sender, &recipient, &token_address, &500);
-        assert_eq!(res.unwrap_err().unwrap(), Error::InsufficientBalance);
-    }
-
-    // ── Meta-transaction tests ─────────────────────────────────────────────
-
-    #[allow(clippy::too_many_arguments)]
-    fn sign_meta_payload(
-        env: &Env,
-        contract_id: &Address,
-        sender: &Address,
-        signer_pubkey: &BytesN<32>,
-        recipient: &Address,
-        token: &Address,
-        amount: i128,
-        nonce: u64,
-        deadline: u64,
-        signing_key: &ed25519_dalek::SigningKey,
-    ) -> BytesN<64> {
-        use ed25519_dalek::Signer;
-        use soroban_sdk::xdr::ToXdr;
-        let mut payload = soroban_sdk::Bytes::new(env);
-        payload.append(&contract_id.to_xdr(env));
-        payload.append(&sender.to_xdr(env));
-        payload.append(&soroban_sdk::Bytes::from_slice(
-            env,
-            &signer_pubkey.to_array(),
-        ));
-        payload.append(&recipient.to_xdr(env));
-        payload.append(&token.to_xdr(env));
-        payload.append(&amount.to_xdr(env));
-        payload.append(&nonce.to_xdr(env));
-        payload.append(&deadline.to_xdr(env));
-        let hash = env.crypto().sha256(&payload);
-        let msg = soroban_sdk::Bytes::from(&hash);
-        let mut buf = [0u8; 32];
-        msg.copy_into_slice(&mut buf);
-        let sig = signing_key.sign(&buf);
-        BytesN::from_array(env, &sig.to_bytes())
-    }
-
-    #[test]
-    fn test_meta_payment_success_and_nonce_increments() {
-        let (env, client, contract_id) = setup_env();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-
-        let (token_address, token_client, sac) = setup_token(&env);
-        sac.mint(&sender, &10_000);
-
-        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
-
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-        let pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
-
-        let amount = 2000i128;
-        let nonce = client.get_meta_nonce(&sender);
-        assert_eq!(nonce, 0);
-        let deadline = env.ledger().timestamp() + 100_000;
-
-        token_client.approve(&sender, &contract_id, &amount, &1_000_000);
-
-        let sig = sign_meta_payload(
-            &env,
-            &contract_id,
-            &sender,
-            &pubkey,
-            &recipient,
-            &token_address,
-            amount,
-            nonce,
-            deadline,
-            &signing_key,
-        );
-
-        client.route_payment_meta(
-            &sender,
-            &pubkey,
-            &recipient,
-            &token_address,
-            &amount,
-            &nonce,
-            &deadline,
-            &sig,
-        );
-
-        assert_eq!(client.get_meta_nonce(&sender), 1);
-        assert_eq!(token_client.balance(&treasury), 20);
-        assert_eq!(token_client.balance(&recipient), 1980);
-        assert_eq!(token_client.balance(&sender), 10_000 - amount);
-    }
-
-    #[test]
-    fn test_meta_payment_replay_rejected() {
-        let (env, client, contract_id) = setup_env();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-
-        let (token_address, token_client, sac) = setup_token(&env);
-        sac.mint(&sender, &10_000);
-
-        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
-
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
-        let pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
-
-        let amount = 1000i128;
-        let nonce = client.get_meta_nonce(&sender);
-        let deadline = env.ledger().timestamp() + 100_000;
-
-        token_client.approve(&sender, &contract_id, &(amount * 2), &1_000_000);
-
-        let sig = sign_meta_payload(
-            &env,
-            &contract_id,
-            &sender,
-            &pubkey,
-            &recipient,
-            &token_address,
-            amount,
-            nonce,
-            deadline,
-            &signing_key,
-        );
-
-        client.route_payment_meta(
-            &sender,
-            &pubkey,
-            &recipient,
-            &token_address,
-            &amount,
-            &nonce,
-            &deadline,
-            &sig,
-        );
-
-        let res = client.try_route_payment_meta(
-            &sender,
-            &pubkey,
-            &recipient,
-            &token_address,
-            &amount,
-            &nonce,
-            &deadline,
-            &sig,
-        );
-        assert_eq!(res.unwrap_err().unwrap(), Error::InvalidNonce);
-    }
-
-    #[test]
-    fn test_meta_payment_expired_rejected() {
-        let (env, client, contract_id) = setup_env();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-
-        let (token_address, token_client, sac) = setup_token(&env);
-        sac.mint(&sender, &10_000);
-
-        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
-
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
-        let pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
-
-        let amount = 1000i128;
-        let nonce = client.get_meta_nonce(&sender);
-        let deadline = env.ledger().timestamp() + 10;
-
-        token_client.approve(&sender, &contract_id, &amount, &1_000_000);
-
-        let sig = sign_meta_payload(
-            &env,
-            &contract_id,
-            &sender,
-            &pubkey,
-            &recipient,
-            &token_address,
-            amount,
-            nonce,
-            deadline,
-            &signing_key,
-        );
-
-        let ts = env.ledger().timestamp();
-        env.ledger().set(LedgerInfo {
-            timestamp: ts + 100_000,
-            protocol_version: env.ledger().protocol_version(),
-            sequence_number: env.ledger().sequence(),
-            network_id: env.ledger().network_id().into(),
-            base_reserve: 100,
-            min_temp_entry_ttl: 16,
-            min_persistent_entry_ttl: 4096,
-            max_entry_ttl: 6312000,
-        });
-
-        let res = client.try_route_payment_meta(
-            &sender,
-            &pubkey,
-            &recipient,
-            &token_address,
-            &amount,
-            &nonce,
-            &deadline,
-            &sig,
-        );
-        assert_eq!(res.unwrap_err().unwrap(), Error::DeadlineExpired);
-    }
-
-    #[test]
-    fn test_daily_limit_and_reset() {
-        let (env, client, _) = setup_env();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-
-        let (token_address, token_client, _token_admin_client) = setup_token(&env);
-
-        let limit = 10_000_000_000_000i128;
-        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
-        sac.mint(&sender, &(limit + 2000));
-
-        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
-        client.add_supported_token(&token_address);
-
-        // Route amount up to daily limit
-        client.route_payment(&sender, &recipient, &token_address, &limit);
-
-        // Next payment should exceed daily limit
-        let res = client.try_route_payment(&sender, &recipient, &token_address, &2000);
-        assert_eq!(res.unwrap_err().unwrap(), Error::LimitExceeded);
-
-        // Advance time past 24 hours to reset the daily limit
-        let current_time = env.ledger().timestamp();
-        let current_protocol_version = env.ledger().protocol_version();
-        env.ledger().set(LedgerInfo {
-            timestamp: current_time + 86400,
-            protocol_version: current_protocol_version,
-            sequence_number: 1,
-            network_id: env.ledger().network_id().into(),
-            base_reserve: 100,
-            min_temp_entry_ttl: 16,
-            min_persistent_entry_ttl: 4096,
-            max_entry_ttl: 6312000,
-        });
-
-        // Now routing should succeed again. The first payment pushed volume past
-        // VOLUME_THRESHOLD, so the halved rate applies: 2000 * 50 bps = 10.
-        client.route_payment(&sender, &recipient, &token_address, &2000);
-        assert_eq!(token_client.balance(&recipient), (limit - 50) + (2000 - 10));
-    }
-
-    #[test]
-    fn test_prevent_self_routing() {
-        let (env, client, _) = setup_env();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let sender = Address::generate(&env);
-
-        let (token_address, _token_client, _token_admin_client) = setup_token(&env);
-        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
-        sac.mint(&sender, &10_000);
-
-        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
-
-        let res = client.try_route_payment(&sender, &sender, &token_address, &1000);
-        assert_eq!(res.unwrap_err().unwrap(), Error::InvalidRecipient);
-    }
-
-    #[test]
-    #[ignore]
-    fn test_tiered_fee_discount_applied_after_volume_threshold() {
-        let (env, client, _) = setup_env();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-
-        let (token_address, token_client, _token_admin_client) = setup_token(&env);
-
-        // Threshold is 10,000 XLM = 10,000 * 10,000,000 (7 decimals)
-        let threshold = 100_000_000_000i128;
-        let first_amount = threshold + 1;
-        let second_amount = 1000i128;
-        let total_mint = first_amount + second_amount + 10_000_000;
-        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
-        sac.mint(&sender, &total_mint);
-
-        // Initialize with 1% fee (100 bps) and no cap
-        client.initialize(
-            &admin,
-            &treasury,
-            &100,
-            &i128::MAX,
-            &PaymentRouter::MAX_AMOUNT,
-        );
-
-        // First payment: volume is 0 (< threshold), full fee applies
-        client.route_payment(&sender, &recipient, &token_address, &first_amount);
-
-        let full_fee_first = (first_amount * 100) / 10_000;
-        assert_eq!(token_client.balance(&treasury), full_fee_first);
-        assert_eq!(
-            token_client.balance(&recipient),
-            first_amount - full_fee_first
-        );
-        assert_eq!(client.get_user_volume(&sender), first_amount);
-        // Volume is now past threshold, so next call gets the discount
-        assert_eq!(client.get_effective_fee_bps(&sender), 50);
-
-        // Second payment: volume > threshold, 50% discount applies
-        client.route_payment(&sender, &recipient, &token_address, &second_amount);
-
-        let discounted_fee = (second_amount * 50) / 10_000;
-        assert_eq!(
-            token_client.balance(&treasury),
-            full_fee_first + discounted_fee
-        );
-        assert_eq!(
-            token_client.balance(&recipient),
-            (first_amount - full_fee_first) + (second_amount - discounted_fee)
-        );
-    }
-
-    #[test]
-    fn test_get_effective_fee_bps_no_discount_below_threshold() {
-        let (env, client, _) = setup_env();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-
-        let (token_address, _token_client, _token_admin_client) = setup_token(&env);
-        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
-        sac.mint(&sender, &1_000_000);
-
-        client.initialize(
-            &admin,
-            &treasury,
-            &100,
-            &i128::MAX,
-            &PaymentRouter::MAX_AMOUNT,
-        );
-
-        // No volume yet
-        assert_eq!(client.get_effective_fee_bps(&sender), 100);
-
-        // Route a small payment (below threshold)
-        client.route_payment(&sender, &recipient, &token_address, &1000);
-
-        // Volume is 1000, far below 10,000 XLM threshold
-        assert_eq!(client.get_effective_fee_bps(&sender), 100);
-    }
-
-    #[test]
-    fn test_successful_xlm_routing() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-        let platform_treasury = Address::generate(&env);
-
-        let contract_id = env.register_contract(None, PaymentRouter);
-        let client = PaymentRouterClient::new(&env, &contract_id);
-
-        client.initialize(
-            &admin,
-            &platform_treasury,
-            &40,
-            &i128::MAX,
-            &PaymentRouter::MAX_AMOUNT,
-        );
-
-        let token_admin = Address::generate(&env);
-        let token_address = env.register_stellar_asset_contract(token_admin.clone());
-        let sac = StellarAssetClient::new(&env, &token_address);
-        let token_client = token::Client::new(&env, &token_address);
-
-        let initial_balance = 1_000_000_000i128;
-        sac.mint(&sender, &initial_balance);
-
-        client.add_supported_token(&token_address);
-
-        let amount = 100_000_000i128;
-        client.route_payment(&sender, &recipient, &token_address, &amount);
-
-        let expected_fee = 400_000i128;
-        let expected_recipient_amount = amount - expected_fee;
-
-        assert_eq!(token_client.balance(&sender), initial_balance - amount);
-        assert_eq!(token_client.balance(&recipient), expected_recipient_amount);
-        assert_eq!(token_client.balance(&platform_treasury), expected_fee);
-    }
-
-    #[test]
-    fn test_initialize_sets_admin() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let contract_addr = env.register_contract(None, PaymentRouter);
-        let client = PaymentRouterClient::new(&env, &contract_addr);
-
-        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
-
-        let stored_admin: Option<Address> = env.as_contract(&contract_addr, || {
-            env.storage().instance().get(&DataKey::Admin)
-        });
-        assert_eq!(stored_admin, Some(admin));
-    }
-
-    /// Verifies that `emergency_withdraw` transfers the exact requested amount
-    /// from the contract's own balance to the admin address.
-    #[test]
-    fn test_emergency_withdraw_transfers_tokens_to_admin() {
-        let (env, client, contract_id) = setup_env();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-
-        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
-
-        let (token_address, token_client, stellar_asset_client) = setup_token(&env);
-
-        // Fund the contract directly (simulates stranded tokens from a routing failure).
-        let stranded_amount = 10_000i128;
-        stellar_asset_client.mint(&contract_id, &stranded_amount);
-
-        assert_eq!(token_client.balance(&contract_id), stranded_amount);
-        assert_eq!(token_client.balance(&admin), 0);
-
-        // Admin withdraws half the stranded balance.
-        let withdraw_amount = 4_000i128;
-        client.emergency_withdraw(&token_address, &withdraw_amount);
-
-        assert_eq!(token_client.balance(&admin), withdraw_amount);
-        assert_eq!(
-            token_client.balance(&contract_id),
-            stranded_amount - withdraw_amount
-        );
-    }
-
-    /// Verifies that `emergency_withdraw` can drain the entire contract balance
-    /// in a single call.
-    #[test]
-    fn test_emergency_withdraw_full_balance() {
-        let (env, client, contract_id) = setup_env();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-
-        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
-
-        let (token_address, token_client, stellar_asset_client) = setup_token(&env);
-
-        let stranded_amount = 7_500i128;
-        stellar_asset_client.mint(&contract_id, &stranded_amount);
-
-        client.emergency_withdraw(&token_address, &stranded_amount);
-
-        assert_eq!(token_client.balance(&admin), stranded_amount);
-        assert_eq!(token_client.balance(&contract_id), 0);
-    }
-
-    /// Verifies that `emergency_withdraw` declares admin authorization as required.
-    ///
-    /// Soroban's `require_auth()` uses an abort-on-failure model in the host
-    /// (non-unwinding panics), so we cannot catch a missing-auth failure inside
-    /// the same test process.  Instead we use `mock_all_auths_allowing_non_root_auth`
-    /// to record which addresses the call attempts to authorize, then assert that
-    /// the admin address — and *only* the admin — appears in that list.
-    #[test]
-    fn test_admin_is_required_for_emergency_withdraw() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let contract_id = env.register_contract(None, PaymentRouter);
-        let client = PaymentRouterClient::new(&env, &contract_id);
-
-        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
-
-        let (token_address, _token_client, stellar_asset_client) = setup_token(&env);
-        stellar_asset_client.mint(&contract_id, &5_000i128);
-
-        // Call succeeds because mock_all_auths satisfies any require_auth.
-        // What we verify is that the invocation recorded exactly one
-        // authorization and that it belongs to admin, proving the function
-        // gates on the admin address.
-        client.emergency_withdraw(&token_address, &1_000i128);
-
-        let auths = env.auths();
-        let admin_auth_present = auths.iter().any(|(addr, _)| *addr == admin);
-        assert!(
-            admin_auth_present,
-            "emergency_withdraw must require the admin address to authorize"
-        );
-    }
-
-    #[test]
-    fn test_blacklist_recipient() {
-        let (env, client, _) = setup_env();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-
-        let (token_address, _token_client, sac) = setup_token(&env);
-        sac.mint(&sender, &10_000);
-
-        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
-
-        // Blacklist the recipient
-        client.blacklist_address(&recipient);
-        assert!(client.is_blacklisted(&recipient));
-
-        // Route payment should fail
-        let res = client.try_route_payment(&sender, &recipient, &token_address, &1000);
-        assert_eq!(res.unwrap_err().unwrap(), Error::Blacklisted);
-
-        // Unblacklist and try again
-        client.unblacklist_address(&recipient);
-        assert!(!client.is_blacklisted(&recipient));
-
-        client
-            .mock_all_auths()
-            .route_payment(&sender, &recipient, &token_address, &1000);
-    }
-
-    #[test]
-    #[ignore]
-    fn test_routes_multiple_distinct_assets() {
-        let (env, client, _) = setup_env();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-
-        client.initialize(
-            &admin,
-            &treasury,
-            &100,
-            &1_000_000,
-            &PaymentRouter::MAX_AMOUNT,
-        );
-
-        let (usdc_like_address, usdc_like_client, usdc_like_admin_client) = setup_token(&env);
-        let (eurc_like_address, eurc_like_client, eurc_like_admin_client) = setup_token(&env);
-        assert_ne!(usdc_like_address, eurc_like_address);
-
-        usdc_like_admin_client.mint(&sender, &10_000);
-        eurc_like_admin_client.mint(&sender, &5_000);
-
-        client.route_payment(&sender, &recipient, &usdc_like_address, &2_000);
-        client.route_payment(&sender, &recipient, &eurc_like_address, &1_000);
-
-        assert_eq!(usdc_like_client.balance(&sender), 8_000);
-        assert_eq!(usdc_like_client.balance(&recipient), 1_980);
-        assert_eq!(eurc_like_client.balance(&sender), 4_000);
-        assert_eq!(eurc_like_client.balance(&recipient), 990);
-        assert_eq!(client.get_user_volume(&sender), 3_000);
-    }
-
-    #[test]
-    fn test_benchmark_gas_costs() {
-        let (env, client, _) = setup_env();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-
-        let (token_address, _token_client, sac) = setup_token(&env);
-        sac.mint(&sender, &10_000);
-
-        // Reset budget before initialization
-        env.budget().reset_default();
-        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
-        let init_cpu = env.budget().cpu_instruction_cost();
-        let init_mem = env.budget().memory_bytes_cost();
-        log!(
-            &env,
-            "GAS REPORT: initialize - CPU: {}, Mem: {}",
-            init_cpu,
-            init_mem
-        );
-
-        // Reset budget before route_payment
-        env.budget().reset_default();
-        client.route_payment(&sender, &recipient, &token_address, &5_000);
-        let route_cpu = env.budget().cpu_instruction_cost();
-        let route_mem = env.budget().memory_bytes_cost();
-        log!(
-            &env,
-            "GAS REPORT: route_payment - CPU: {}, Mem: {}",
-            route_cpu,
-            route_mem
-        );
-
-        env.budget().print();
-
-        // Fails CI if gas costs exceed defined thresholds
-        // Set reasonable thresholds (e.g. 5M CPU and 2MB Mem per call)
-        let max_cpu = 5_000_000;
-        let max_mem = 2_000_000;
-
-        assert!(
-            init_cpu <= max_cpu,
-            "initialize CPU cost exceeded threshold! Cost: {}, Threshold: {}",
-            init_cpu,
-            max_cpu
-        );
-        assert!(
-            init_mem <= max_mem,
-            "initialize Memory cost exceeded threshold! Cost: {}, Threshold: {}",
-            init_mem,
-            max_mem
-        );
-
-        assert!(
-            route_cpu <= max_cpu,
-            "route_payment CPU cost exceeded threshold! Cost: {}, Threshold: {}",
-            route_cpu,
-            max_cpu
-        );
-        assert!(
-            route_mem <= max_mem,
-            "route_payment Memory cost exceeded threshold! Cost: {}, Threshold: {}",
-            route_mem,
-            max_mem
-        );
-    }
-
-    /// Rebuilds the pre-#663 packed `UserSpending` value (`BytesN<24>`) so
-    /// tests can emulate legacy ledger state written by the old two-entry
-    /// storage format.
-    fn pack_legacy_spending_for_test(
-        env: &Env,
-        last_reset_time: u64,
-        accumulated_amount: i128,
-    ) -> BytesN<24> {
-        let mut buf = [0u8; 24];
-        buf[..8].copy_from_slice(&last_reset_time.to_be_bytes());
-        buf[8..24].copy_from_slice(&accumulated_amount.to_be_bytes());
-        BytesN::from_array(env, &buf)
-    }
-
-    /// Moves the oracle-style test ledger off timestamp 0, which `get_price`
-    /// treats as a stale quote.
-    fn set_realistic_ledger_time(env: &Env) {
-        env.ledger().set(LedgerInfo {
-            timestamp: 1_000_000,
-            protocol_version: env.ledger().protocol_version(),
-            sequence_number: env.ledger().sequence(),
-            network_id: env.ledger().network_id().into(),
-            base_reserve: 100,
-            min_temp_entry_ttl: 16,
-            min_persistent_entry_ttl: 4096,
-            max_entry_ttl: 6312000,
-        });
-    }
-
-    /// Issue #663 acceptance benchmark: per-user (tag) registration storage
-    /// cost must drop by at least 20%.
-    ///
-    /// The benchmark isolates the storage write path that registering a
-    /// sender's first payment touches:
-    ///
-    /// * Legacy (pre-#663): two persistent entries (`UserSpending` +
-    ///   `UserVolume`), each with its own write and TTL extension.
-    /// * New (#663): one packed `UserRecord` entry with a single write and
-    ///   TTL extension.
-    ///
-    /// It fails CI if the new path is not at least 20% cheaper in CPU
-    /// instructions, if it uses more memory, or if the deterministic
-    /// entry-count accounting (one entry instead of two) no longer holds.
-    #[test]
-    fn test_benchmark_storage_cost_reduction() {
-        let (env, _client, contract_id) = setup_env();
-
-        // `legacy_sender` emulates the pre-#663 two-entry write path;
-        // `packed_sender` exercises the new single-entry write path.
-        let legacy_sender = Address::generate(&env);
-        let packed_sender = Address::generate(&env);
-
-        let current_time = env.ledger().timestamp();
-        let amount = 5_000i128;
-
-        // Warm-up so lazy host/footprint initialization does not skew the
-        // first measurement window.
-        env.as_contract(&contract_id, || {
-            env.storage()
-                .instance()
-                .set(&DataKey::Admin, &legacy_sender);
-        });
-        env.budget().reset_default();
-
-        // ── Legacy (pre-#663) registration write path ────────────────────
-        {
-            let legacy_sender = legacy_sender.clone();
-            env.as_contract(&contract_id, || {
-                let spending_key = DataKey::UserSpending(legacy_sender.clone());
-                env.storage().persistent().set(
-                    &spending_key,
-                    &pack_legacy_spending_for_test(&env, current_time, amount),
-                );
-                env.storage().persistent().extend_ttl(
-                    &spending_key,
-                    PaymentRouter::PERSISTENT_LIFETIME_THRESHOLD,
-                    PaymentRouter::PERSISTENT_BUMP_AMOUNT,
-                );
-
-                let volume_key = DataKey::UserVolume(legacy_sender.clone());
-                env.storage().persistent().set(&volume_key, &amount);
-                env.storage().persistent().extend_ttl(
-                    &volume_key,
-                    PaymentRouter::PERSISTENT_LIFETIME_THRESHOLD,
-                    PaymentRouter::PERSISTENT_BUMP_AMOUNT,
-                );
-            });
-        }
-        let legacy_cpu = env.budget().cpu_instruction_cost();
-        let legacy_mem = env.budget().memory_bytes_cost();
-
-        env.budget().reset_default();
-
-        // ── New (#663) registration write path ───────────────────────────
-        {
-            let packed_sender = packed_sender.clone();
-            env.as_contract(&contract_id, || {
-                let record_key = DataKey::UserRecord(packed_sender.clone());
-                let record = pack_user_record(&env, current_time, amount, amount);
-                env.storage().persistent().set(&record_key, &record);
-                env.storage().persistent().extend_ttl(
-                    &record_key,
-                    PaymentRouter::PERSISTENT_LIFETIME_THRESHOLD,
-                    PaymentRouter::PERSISTENT_BUMP_AMOUNT,
-                );
-            });
-        }
-        let new_cpu = env.budget().cpu_instruction_cost();
-        let new_mem = env.budget().memory_bytes_cost();
-
-        std::eprintln!(
-            "GAS REPORT: user-registration storage legacy (2 entries) - CPU: {}, Mem: {}",
-            legacy_cpu,
-            legacy_mem
-        );
-        std::eprintln!(
-            "GAS REPORT: user-registration storage packed (1 entry)  - CPU: {}, Mem: {}",
-            new_cpu,
-            new_mem
-        );
-        std::eprintln!(
-            "GAS REPORT: user-registration storage CPU reduction: {}%",
-            100 - (new_cpu * 100) / legacy_cpu
-        );
-
-        // Deterministic accounting: the legacy path leaves two persistent
-        // entries per registered sender, the new path exactly one.
-        env.as_contract(&contract_id, || {
-            assert!(
-                env.storage()
-                    .persistent()
-                    .has(&DataKey::UserSpending(legacy_sender.clone())),
-                "legacy path must write the UserSpending entry"
-            );
-            assert!(
-                env.storage()
-                    .persistent()
-                    .has(&DataKey::UserVolume(legacy_sender.clone())),
-                "legacy path must write the UserVolume entry"
-            );
-            assert!(
-                env.storage()
-                    .persistent()
-                    .has(&DataKey::UserRecord(packed_sender.clone())),
-                "new path must write the packed UserRecord entry"
-            );
-        });
-
-        // Acceptance criterion: >= 20% CPU-instruction reduction.
-        assert!(
-            new_cpu * 10 <= legacy_cpu * 8,
-            "packed registration write path must cost >= 20% less CPU \
-             (legacy: {}, packed: {}, reduction: {}%)",
-            legacy_cpu,
-            new_cpu,
-            100 - (new_cpu * 100) / legacy_cpu
-        );
-        // Memory must not regress either.
-        assert!(
-            new_mem <= legacy_mem,
-            "packed registration write path must not use more memory \
-             (legacy: {}, packed: {})",
-            legacy_mem,
-            new_mem
-        );
-    }
-
-    /// The packed `UserRecord` replaces the two per-user entries and keeps
-    /// every public getter consistent (issue #663).
-    #[test]
-    fn test_user_record_packed_storage_roundtrip() {
-        let (env, client, contract_id) = setup_env();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-
-        let (token_address, _token_client, sac) = setup_token(&env);
-        sac.mint(&sender, &10_000);
-
-        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
-
-        // Fresh sender: zeroed record, window anchored at "now".
-        let before = client.get_user_record(&sender);
-        assert_eq!(before.volume, 0);
-        assert_eq!(before.accumulated_amount, 0);
-        assert_eq!(before.last_reset_time, env.ledger().timestamp());
-
-        // The first payment registers the sender's packed record.
-        client.route_payment(&sender, &recipient, &token_address, &2_000);
-
-        let after_first = client.get_user_record(&sender);
-        assert_eq!(after_first.accumulated_amount, 2_000);
-        assert_eq!(after_first.volume, 2_000);
-
-        // Exactly one persistent user entry now exists — the packed record.
-        env.as_contract(&contract_id, || {
-            let record_key = DataKey::UserRecord(sender.clone());
-            assert!(env.storage().persistent().has(&record_key));
-            assert!(!env
-                .storage()
-                .persistent()
-                .has(&DataKey::UserSpending(sender.clone())));
-            assert!(!env
-                .storage()
-                .persistent()
-                .has(&DataKey::UserVolume(sender.clone())));
-        });
-
-        // A second payment accumulates in both counters.
-        client.route_payment(&sender, &recipient, &token_address, &3_000);
-
-        let after_second = client.get_user_record(&sender);
-        assert_eq!(after_second.accumulated_amount, 5_000);
-        assert_eq!(after_second.volume, 5_000);
-
-        // The pre-existing getters stay consistent with the packed record.
-        assert_eq!(client.get_user_volume(&sender), 5_000);
-    }
-
-    /// Permissionless `migrate_user_record` combines legacy entries into the
-    /// packed format and removes the old keys (issue #663).
-    #[test]
-    fn test_migrate_user_record_combines_legacy_entries() {
-        let (env, client, contract_id) = setup_env();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let user = Address::generate(&env);
-
-        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
-
-        // Give the ledger a realistic timestamp so the legacy window start can
-        // be back-dated.
-        set_realistic_ledger_time(&env);
-
-        // Emulate pre-#663 ledger state: split UserSpending + UserVolume.
-        let legacy_window_start = env.ledger().timestamp() - 60;
-        let spending_key = DataKey::UserSpending(user.clone());
-        let volume_key = DataKey::UserVolume(user.clone());
-        env.as_contract(&contract_id, || {
-            env.storage().persistent().set(
-                &spending_key,
-                &pack_legacy_spending_for_test(&env, legacy_window_start, 1_200),
-            );
-            env.storage().persistent().set(&volume_key, &7_500i128);
-        });
-
-        // Getters still see the legacy state through the fallback path.
-        assert_eq!(client.get_user_volume(&user), 7_500);
-        let pre = client.get_user_record(&user);
-        assert_eq!(pre.accumulated_amount, 1_200);
-        assert_eq!(pre.volume, 7_500);
-
-        // Migrate: reports success, writes the packed record, drops the
-        // legacy keys.
-        assert!(client.migrate_user_record(&user));
-
-        env.as_contract(&contract_id, || {
-            let record_key = DataKey::UserRecord(user.clone());
-            assert!(env.storage().persistent().has(&record_key));
-            assert!(!env.storage().persistent().has(&spending_key));
-            assert!(!env.storage().persistent().has(&volume_key));
-        });
-
-        let post = client.get_user_record(&user);
-        assert_eq!(post.accumulated_amount, 1_200);
-        assert_eq!(post.volume, 7_500);
-        assert_eq!(post.last_reset_time, legacy_window_start);
-        assert_eq!(client.get_user_volume(&user), 7_500);
-
-        // Migrating again is a no-op.
-        assert!(!client.migrate_user_record(&user));
-
-        // And a fresh payment continues from the migrated record.
-        let (token_address, _token_client, sac) = setup_token(&env);
-        sac.mint(&user, &10_000);
-        let recipient = Address::generate(&env);
-        client.route_payment(&user, &recipient, &token_address, &500);
-
-        let after = client.get_user_record(&user);
-        assert_eq!(after.accumulated_amount, 1_700);
-        assert_eq!(after.volume, 8_000);
-        assert_eq!(client.get_user_volume(&user), 8_000);
-    }
-
-    /// A payment routed by a sender that only has legacy entries transparently
-    /// upgrades them to the packed record (issue #663 migration path).
-    #[test]
-    fn test_route_payment_upgrades_legacy_entries_in_place() {
-        let (env, client, contract_id) = setup_env();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-
-        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
-
-        // Give the ledger a realistic timestamp so the legacy window start can
-        // be back-dated.
-        set_realistic_ledger_time(&env);
-
-        // Legacy state from before the upgrade.
-        let legacy_window_start = env.ledger().timestamp() - 60;
-        let spending_key = DataKey::UserSpending(sender.clone());
-        let volume_key = DataKey::UserVolume(sender.clone());
-        env.as_contract(&contract_id, || {
-            env.storage().persistent().set(
-                &spending_key,
-                &pack_legacy_spending_for_test(&env, legacy_window_start, 4_000),
-            );
-            env.storage().persistent().set(&volume_key, &20_000i128);
-        });
-
-        let (token_address, _token_client, sac) = setup_token(&env);
-        sac.mint(&sender, &50_000);
-
-        // No explicit migration needed: routing the payment combines the
-        // legacy entries into the packed record on its next write.
-        client.route_payment(&sender, &recipient, &token_address, &1_000);
-
-        env.as_contract(&contract_id, || {
-            let record_key = DataKey::UserRecord(sender.clone());
-            assert!(env.storage().persistent().has(&record_key));
-            assert!(!env.storage().persistent().has(&spending_key));
-            assert!(!env.storage().persistent().has(&volume_key));
-        });
-
-        let record = client.get_user_record(&sender);
-        assert_eq!(record.accumulated_amount, 5_000);
-        assert_eq!(record.volume, 21_000);
-        assert_eq!(client.get_user_volume(&sender), 21_000);
-    }
-
-    /// `migrate_user_record` is a safe no-op for unknown senders and for
-    /// senders that already have a packed record (issue #663).
-    #[test]
-    fn test_migrate_user_record_no_op_cases() {
-        let (env, client, _) = setup_env();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let unknown = Address::generate(&env);
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-
-        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
-
-        // Unknown sender: nothing to migrate.
-        assert!(!client.migrate_user_record(&unknown));
-
-        // Sender with a packed record already: nothing to migrate.
-        let (token_address, _token_client, sac) = setup_token(&env);
-        sac.mint(&sender, &10_000);
-        client.route_payment(&sender, &recipient, &token_address, &1_000);
-        assert!(!client.migrate_user_record(&sender));
-
-        // State is untouched.
-        let record = client.get_user_record(&sender);
-        assert_eq!(record.volume, 1_000);
-        assert_eq!(record.accumulated_amount, 1_000);
-    }
-
-    #[test]
-    #[ignore]
-    fn test_refund_ledger_and_withdrawal() {
-        let (env, client, contract_id) = setup_env();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let user = Address::generate(&env);
-
-        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
-
-        let (token_address, token_client, stellar_asset_client) = setup_token(&env);
-
-        // Initially zero refund balance
-        assert_eq!(client.get_refund_balance(&user, &token_address), 0);
-
-        // Simulate stranded tokens in contract and credit internal refund balance
-        let refund_amount = 5_000i128;
-        stellar_asset_client.mint(&contract_id, &refund_amount);
-
-        env.as_contract(&contract_id, || {
-            PaymentRouter::credit_refund_balance(&env, &user, &token_address, refund_amount);
-        });
-
-        assert_eq!(
-            client.get_refund_balance(&user, &token_address),
-            refund_amount
-        );
-
-        // User withdraws partial refund
-        let partial_amount = 2_000i128;
-        client.withdraw_refund(&user, &token_address, &partial_amount);
-
-        assert_eq!(token_client.balance(&user), partial_amount);
-        assert_eq!(
-            client.get_refund_balance(&user, &token_address),
-            refund_amount - partial_amount
-        );
-
-        // User claims remaining refunds with claim_all_refunds
-        let claimed = client.claim_all_refunds(&user, &token_address);
-        assert_eq!(claimed, refund_amount - partial_amount);
-        assert_eq!(token_client.balance(&user), refund_amount);
-        assert_eq!(client.get_refund_balance(&user, &token_address), 0);
-
-        // Trying to withdraw again should fail with NoRefundAvailable
-        let res = client.try_withdraw_refund(&user, &token_address, &100);
-        assert_eq!(res.unwrap_err().unwrap(), Error::NoRefundAvailable);
-    }
-
-    #[test]
-    fn test_governance_takes_over_fees() {
-        let (_, client, _) = setup_env();
-
-        let admin = Address::generate(&client.env);
-        let treasury = Address::generate(&client.env);
-        let gov = Address::generate(&client.env);
-
-        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
-
-        // Admin can still update fees before governance is set
-        client.set_fee_bps(&150);
-        assert_eq!(client.get_fee(), 150);
-
-        // Admin hands control over to governance
-        client.set_governance(&gov);
-
-        // Governance address can now update the fee
-        client.set_fee_bps(&200);
-        assert_eq!(client.get_fee(), 200);
-    }
-
-    /// Instance-storage keys for [`MockDex`].
-    #[contracttype]
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    pub enum MockDexKey {
-        RateNum,
-        RateDen,
-        ShouldRevert,
-    }
-
-    /// Errors the mock DEX can return.
-    #[contracterror]
-    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-    pub enum MockDexError {
-        /// The mock was told to simulate a failing DEX.
-        Reverted = 1,
-    }
-
-    /// Minimal stand-in for a Soroban DEX, exposing the adapter interface the
-    /// payment router expects:
-    /// `swap(sell_token, buy_token, amount_in, min_amount_out, recipient) -> i128`
-    /// and `quote(sell_token, buy_token, amount_in) -> i128`.
-    ///
-    /// It trades at a configurable rate.  The router funds it with the sell
-    /// token before the call, so `swap` only has to settle the buy token to
-    /// `recipient`.
-    #[contract]
-    pub struct MockDex;
-
-    #[contractimpl]
-    impl MockDex {
-        /// Sets the swap rate: `amount_out = amount_in * num / den`.
-        pub fn set_rate(env: Env, num: i128, den: i128) {
-            env.storage().instance().set(&MockDexKey::RateNum, &num);
-            env.storage().instance().set(&MockDexKey::RateDen, &den);
-        }
-
-        /// Makes `swap` revert, simulating a DEX that cannot fill the trade.
-        pub fn set_should_revert(env: Env, should_revert: bool) {
-            env.storage()
-                .instance()
-                .set(&MockDexKey::ShouldRevert, &should_revert);
-        }
-
-        /// Prices a swap without moving any funds.
-        pub fn quote(env: Env, _sell_token: Address, _buy_token: Address, amount_in: i128) -> i128 {
-            Self::rate(&env, amount_in)
-        }
-
-        /// Sells the `amount_in` sell token this adapter was funded with and
-        /// delivers the buy token to `recipient`.
-        pub fn swap(
-            env: Env,
-            sell_token: Address,
-            buy_token: Address,
-            amount_in: i128,
-            _min_amount_out: i128,
-            recipient: Address,
-        ) -> Result<i128, MockDexError> {
-            if env
-                .storage()
-                .instance()
-                .get(&MockDexKey::ShouldRevert)
-                .unwrap_or(false)
-            {
-                return Err(MockDexError::Reverted);
-            }
-            // The router has already funded this adapter with `amount_in` of
-            // the sell token, so the only work left is to sell it and settle
-            // the buy token to `recipient`.
-            let _ = sell_token;
-            let amount_out = Self::rate(&env, amount_in);
-            let buy_client = token::Client::new(&env, &buy_token);
-            buy_client.transfer(&env.current_contract_address(), &recipient, &amount_out);
-
-            Ok(amount_out)
-        }
-
-        /// PROBE: pull into self.
-        pub fn probe_self_take(env: Env, token_addr: Address, from: Address, amount: i128) -> i128 {
-            from.require_auth();
-            let c = token::Client::new(&env, &token_addr);
-            c.transfer(&from, &env.current_contract_address(), &amount);
-            amount
-        }
-
-        /// PROBE: pay out to another contract.
-        pub fn probe_pay_to_contract(
-            env: Env,
-            token_addr: Address,
-            to: Address,
-            amount: i128,
-        ) -> i128 {
-            let c = token::Client::new(&env, &token_addr);
-            c.transfer(&env.current_contract_address(), &to, &amount);
-            amount
-        }
-
-        /// Applies the configured rate to `amount_in`.
-        fn rate(env: &Env, amount_in: i128) -> i128 {
-            let num: i128 = env
-                .storage()
-                .instance()
-                .get(&MockDexKey::RateNum)
-                .unwrap_or(1);
-            let den: i128 = env
-                .storage()
-                .instance()
-                .get(&MockDexKey::RateDen)
-                .unwrap_or(1);
-            amount_in * num / den
-        }
-    }
-
-    /// Moves the test ledger to `timestamp`.
-    fn set_timestamp(env: &Env, timestamp: u64) {
-        env.ledger().set(LedgerInfo {
-            timestamp,
-            protocol_version: env.ledger().protocol_version(),
-            sequence_number: env.ledger().sequence(),
-            network_id: env.ledger().network_id().into(),
-            base_reserve: 100,
-            min_temp_entry_ttl: 16,
-            min_persistent_entry_ttl: 4096,
-            max_entry_ttl: 6312000,
-        });
-    }
-
-    /// A funded router, two tokens, and a registered mock DEX trading the sell
-    /// token for the buy token at `rate_num:rate_den`.
-    struct SwapFixture {
-        env: Env,
-        client: PaymentRouterClient<'static>,
-        contract_id: Address,
-        treasury: Address,
-        sender: Address,
-        recipient: Address,
-        dex: Address,
-        sell_token: Address,
-        buy_token: Address,
-        sell_client: token::Client<'static>,
-        buy_client: token::Client<'static>,
-        dex_client: MockDexClient<'static>,
-    }
-
-    impl SwapFixture {
-        /// A new address holding `amount` of the sell token.
-        fn funded_sender(&self, amount: i128) -> Address {
-            let sender = Address::generate(&self.env);
-            let sac = token::StellarAssetClient::new(&self.env, &self.sell_token);
-            sac.mint(&sender, &amount);
-            sender
-        }
-
-        /// Builds a swap-routed payment from `sender` to the fixture recipient
-        /// with no deadline and no quote supplied, so only `min_amount_out`
-        /// guards it.
-        fn payment_from(
-            &self,
-            sender: &Address,
-            amount_in: i128,
-            min_amount_out: i128,
-        ) -> SwapPayment {
-            SwapPayment {
-                sender: sender.clone(),
-                recipient: self.recipient.clone(),
-                sell_token: self.sell_token.clone(),
-                buy_token: self.buy_token.clone(),
-                amount_in,
-                min_amount_out,
-                expected_amount_out: 0,
-                deadline: 0,
-                dex: self.dex.clone(),
-            }
-        }
-
-        /// A swap-routed payment from the fixture's main sender.
-        fn payment(&self, amount_in: i128, min_amount_out: i128) -> SwapPayment {
-            self.payment_from(&self.sender, amount_in, min_amount_out)
-        }
-    }
-
-    /// Deploys a router with a 1% platform fee capped at 1_000 base units, two
-    /// Stellar Asset Contracts, and a registered mock DEX at `rate_num:rate_den`.
-    fn setup_swap_fixture(rate_num: i128, rate_den: i128) -> SwapFixture {
-        let env = Env::default();
-        env.mock_all_auths();
-        // A swap crosses two extra contracts per payment, which can outrun the
-        // default test budget; these tests assert behaviour, not gas.
-        env.budget().reset_unlimited();
-        let contract_id = env.register_contract(None, PaymentRouter);
-        let client = PaymentRouterClient::new(&env, &contract_id);
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-
-        client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
-
-        let (sell_token, sell_client, sell_admin_client) = setup_token(&env);
-        let (buy_token, buy_client, buy_admin_client) = setup_token(&env);
-
-        // The DEX trades at the configured rate and is pre-funded with the
-        // buy token so it can settle.
-        let dex = env.register_contract(None, MockDex);
-        let dex_client = MockDexClient::new(&env, &dex);
-        dex_client.set_rate(&rate_num, &rate_den);
-        buy_admin_client.mint(&dex, &10_000_000);
-
-        sell_admin_client.mint(&sender, &1_000_000);
-
-        client.register_dex(&dex);
-
-        SwapFixture {
-            env,
-            client,
-            contract_id,
-            treasury,
-            sender,
-            recipient,
-            dex,
-            sell_token,
-            buy_token,
-            sell_client,
-            buy_client,
-            dex_client,
-        }
-    }
-
-    #[test]
-    fn test_route_payment_with_swap_delivers_buy_token_after_fee() {
-        let f = setup_swap_fixture(1, 1);
-
-        // 10 000 sell tokens in, 10 000 buy tokens out, 1% fee = 100.
-        let delivered = f.client.route_payment_with_swap(&f.payment(10_000, 10_000));
-        assert_eq!(delivered, 9_900);
-
-        assert_eq!(f.sell_client.balance(&f.sender), 990_000);
-        assert_eq!(f.buy_client.balance(&f.recipient), 9_900);
-        assert_eq!(f.buy_client.balance(&f.treasury), 100);
-        // The sell token ended up in the DEX, and volume is booked on it.
-        assert_eq!(f.sell_client.balance(&f.dex), 10_000);
-        assert_eq!(f.sell_client.balance(&f.contract_id), 0);
-        assert_eq!(f.client.get_user_volume(&f.sender), 10_000);
-    }
-
-    #[test]
-    fn test_route_payment_with_swap_honours_a_worse_exchange_rate() {
-        // The DEX returns one buy token for every two sold.
-        let f = setup_swap_fixture(1, 2);
-
-        let delivered = f.client.route_payment_with_swap(&f.payment(10_000, 5_000));
-        assert_eq!(delivered, 4_950); // 5_000 out less the 1% fee
-        assert_eq!(f.buy_client.balance(&f.recipient), 4_950);
-        assert_eq!(f.buy_client.balance(&f.treasury), 50);
-    }
-
-    #[test]
-    fn test_swap_below_min_amount_out_reverts_the_whole_payment() {
-        let f = setup_swap_fixture(1, 2);
-
-        // Only 5_000 buy tokens are available, so a 6_000 floor must abort.
-        let payment = f.payment(10_000, 6_000);
-        let res = f.client.try_route_payment_with_swap(&payment);
-        assert_eq!(res.unwrap_err().unwrap(), Error::SlippageExceeded);
-
-        // Atomic failure: the sender keeps every token, nobody is paid, and no
-        // state was booked.
-        assert_eq!(f.sell_client.balance(&f.sender), 1_000_000);
-        assert_eq!(f.sell_client.balance(&f.dex), 0);
-        assert_eq!(f.buy_client.balance(&f.recipient), 0);
-        assert_eq!(f.buy_client.balance(&f.treasury), 0);
-        assert_eq!(f.client.get_user_volume(&f.sender), 0);
-    }
-
-    #[test]
-    fn test_swap_beyond_max_slippage_ceiling_reverts_the_payment() {
-        let f = setup_swap_fixture(1, 1);
-
-        // min_amount_out is easy to clear, but the caller also quoted 20 000,
-        // which is 100% better than the 10 000 actually delivered.
-        let mut payment = f.payment(10_000, 1);
-        payment.expected_amount_out = 20_000;
-
-        let res = f.client.try_route_payment_with_swap(&payment);
-        assert_eq!(res.unwrap_err().unwrap(), Error::SlippageExceeded);
-        assert_eq!(f.buy_client.balance(&f.recipient), 0);
-        assert_eq!(f.sell_client.balance(&f.sender), 1_000_000);
-    }
-
-    #[test]
-    fn test_swap_within_max_slippage_ceiling_settles() {
-        let f = setup_swap_fixture(1, 1);
-
-        // 10% default ceiling: a 9_500 output against a 10_000 quote clears it.
-        let mut payment = f.payment(10_000, 9_500);
-        payment.expected_amount_out = 10_000;
-
-        // 10 000 out, which is 5% under the 10 000 quote, clears the 10%
-        // ceiling; the 1% fee is taken from the output.
-        let delivered = f.client.route_payment_with_swap(&payment);
-        assert_eq!(delivered, 9_900);
-        assert_eq!(f.buy_client.balance(&f.recipient), 9_900);
-    }
-
-    #[test]
-    fn test_swap_failing_dex_aborts_the_payment() {
-        let f = setup_swap_fixture(1, 1);
-        f.dex_client.set_should_revert(&true);
-
-        let res = f.client.try_route_payment_with_swap(&f.payment(10_000, 1));
-        assert_eq!(res.unwrap_err().unwrap(), Error::SwapFailed);
-
-        assert_eq!(f.sell_client.balance(&f.sender), 1_000_000);
-        assert_eq!(f.buy_client.balance(&f.recipient), 0);
-        assert_eq!(f.buy_client.balance(&f.treasury), 0);
-        assert_eq!(f.client.get_user_volume(&f.sender), 0);
-    }
-
-    #[test]
-    fn test_swap_requires_a_registered_dex() {
-        let f = setup_swap_fixture(1, 1);
-
-        let mut payment = f.payment(10_000, 1);
-        payment.dex = Address::generate(&f.env);
-
-        let res = f.client.try_route_payment_with_swap(&payment);
-        assert_eq!(res.unwrap_err().unwrap(), Error::DexNotRegistered);
-        assert_eq!(f.sell_client.balance(&f.sender), 1_000_000);
-    }
-
-    #[test]
-    fn test_swap_after_its_deadline_is_rejected() {
-        let f = setup_swap_fixture(1, 1);
-        set_timestamp(&f.env, 1_000);
-
-        let mut payment = f.payment(10_000, 1);
-        payment.deadline = 500;
-
-        let res = f.client.try_route_payment_with_swap(&payment);
-        assert_eq!(res.unwrap_err().unwrap(), Error::SwapDeadlineExpired);
-        assert_eq!(f.sell_client.balance(&f.sender), 1_000_000);
-    }
-
-    #[test]
-    fn test_swap_within_its_deadline_settles() {
-        let f = setup_swap_fixture(1, 1);
-        set_timestamp(&f.env, 1_000);
-
-        let mut payment = f.payment(10_000, 1);
-        payment.deadline = 1_500;
-
-        assert_eq!(f.client.route_payment_with_swap(&payment), 9_900);
-    }
-
-    #[test]
-    fn test_swap_rejects_unusable_parameters() {
-        let f = setup_swap_fixture(1, 1);
-
-        // Same token on both sides is not a swap.
-        let mut same_token = f.payment(10_000, 1);
-        same_token.buy_token = same_token.sell_token.clone();
-        assert_eq!(
-            f.client
-                .try_route_payment_with_swap(&same_token)
-                .unwrap_err()
-                .unwrap(),
-            Error::InvalidSwapParams
-        );
-
-        // A zero floor would accept any output, including none at all.
-        let mut no_floor = f.payment(10_000, 0);
-        no_floor.min_amount_out = 0;
-        assert_eq!(
-            f.client
-                .try_route_payment_with_swap(&no_floor)
-                .unwrap_err()
-                .unwrap(),
-            Error::InvalidSwapParams
-        );
-    }
-
-    #[test]
-    fn test_swap_enforces_balance_limits_and_recipient_rules() {
-        let f = setup_swap_fixture(1, 1);
-
-        // More sell tokens than the sender holds.
-        let res = f
-            .client
-            .try_route_payment_with_swap(&f.payment(2_000_000, 1));
-        assert_eq!(res.unwrap_err().unwrap(), Error::InsufficientBalance);
-
-        // Self-routing is refused, same as on the direct path.
-        let mut self_pay = f.payment(1_000, 1);
-        self_pay.recipient = self_pay.sender.clone();
-        assert_eq!(
-            f.client
-                .try_route_payment_with_swap(&self_pay)
-                .unwrap_err()
-                .unwrap(),
-            Error::InvalidRecipient
-        );
-
-        // Blacklisted recipients are refused.
-        f.client.blacklist_address(&f.recipient);
-        assert_eq!(
-            f.client
-                .try_route_payment_with_swap(&f.payment(1_000, 1))
-                .unwrap_err()
-                .unwrap(),
-            Error::Blacklisted
-        );
-    }
-
-    #[test]
-    fn test_swap_is_blocked_while_paused_or_frozen() {
-        let f = setup_swap_fixture(1, 1);
-        let payment = f.payment(10_000, 1);
-
-        f.client.set_pause(&true);
-        assert_eq!(
-            f.client
-                .try_route_payment_with_swap(&payment)
-                .unwrap_err()
-                .unwrap(),
-            Error::Paused
-        );
-
-        f.client.set_pause(&false);
-        f.client.emergency_freeze();
-        assert_eq!(
-            f.client
-                .try_route_payment_with_swap(&payment)
-                .unwrap_err()
-                .unwrap(),
-            Error::ContractFrozen
-        );
-    }
-
-    #[test]
-    fn test_route_payments_with_swap_settles_every_payment() {
-        let f = setup_swap_fixture(1, 1);
-        let second_sender = f.funded_sender(2_000);
-
-        let batch = vec![
-            &f.env,
-            f.payment_from(&f.sender, 1_000, 1_000),
-            f.payment_from(&second_sender, 2_000, 2_000),
-        ];
-        assert_eq!(f.client.route_payments_with_swap(&batch), 2_970);
-        assert_eq!(f.buy_client.balance(&f.recipient), 2_970);
-        assert_eq!(f.buy_client.balance(&f.treasury), 30);
-        assert_eq!(f.client.get_user_volume(&f.sender), 1_000);
-        assert_eq!(f.client.get_user_volume(&second_sender), 2_000);
-    }
-
-    #[test]
-    fn test_route_payments_with_swap_reverts_the_whole_batch() {
-        let f = setup_swap_fixture(1, 1);
-        let second_sender = f.funded_sender(1_000);
-
-        // The first payment is fine; the second names an unregistered DEX.
-        let mut failing = f.payment_from(&second_sender, 1_000, 1_000);
-        failing.dex = Address::generate(&f.env);
-        let batch = vec![&f.env, f.payment(1_000, 1_000), failing];
-
-        let res = f.client.try_route_payments_with_swap(&batch);
-        assert_eq!(res.unwrap_err().unwrap(), Error::DexNotRegistered);
-
-        // The first payment was rolled back along with the second: the swap it
-        // had already executed is undone and nothing is booked.
-        assert_eq!(f.buy_client.balance(&f.recipient), 0);
-        assert_eq!(f.buy_client.balance(&f.treasury), 0);
-        assert_eq!(f.sell_client.balance(&f.sender), 1_000_000);
-        assert_eq!(f.sell_client.balance(&f.dex), 0);
-        assert_eq!(f.client.get_user_volume(&f.sender), 0);
-    }
-
-    #[test]
-    fn test_quote_swap_returns_a_slippage_adjusted_floor() {
-        let f = setup_swap_fixture(1, 1);
-
-        let quote = f
-            .client
-            .quote_swap(&f.dex, &f.sell_token, &f.buy_token, &10_000);
-        assert_eq!(quote.amount_out, 10_000);
-        assert_eq!(
-            quote.max_slippage_bps,
-            PaymentRouter::DEFAULT_MAX_SLIPPAGE_BPS
-        );
-        assert_eq!(quote.min_amount_out, 9_000); // 10% below the quote
-    }
-
-    #[test]
-    fn test_quote_swap_rejects_an_unregistered_dex() {
-        let f = setup_swap_fixture(1, 1);
-
-        let res =
-            f.client
-                .try_quote_swap(&Address::generate(&f.env), &f.sell_token, &f.buy_token, &1);
-        assert_eq!(res.unwrap_err().unwrap(), Error::DexNotRegistered);
-    }
-
-    #[test]
-    fn test_max_slippage_bps_is_bounded_and_tightens_the_quote() {
-        let f = setup_swap_fixture(1, 1);
-
-        assert_eq!(
-            f.client.get_max_slippage_bps(),
-            PaymentRouter::DEFAULT_MAX_SLIPPAGE_BPS
-        );
-        assert_eq!(
-            f.client
-                .try_set_max_slippage_bps(&10_001)
-                .unwrap_err()
-                .unwrap(),
-            Error::InvalidSwapParams
-        );
-        assert_eq!(
-            f.client.try_set_max_slippage_bps(&-1).unwrap_err().unwrap(),
-            Error::InvalidSwapParams
-        );
-
-        f.client.set_max_slippage_bps(&500);
-        assert_eq!(f.client.get_max_slippage_bps(), 500);
-        assert_eq!(
-            f.client
-                .quote_swap(&f.dex, &f.sell_token, &f.buy_token, &10_000)
-                .min_amount_out,
-            9_500
-        );
-    }
-
-    #[test]
-    fn test_dex_registration_goes_through_the_timelock() {
-        let f = setup_swap_fixture(1, 1);
-
-        let second_dex = f.env.register_contract(None, MockDex);
-        assert!(!f.client.is_dex_registered(&second_dex));
-
-        let nonce = f
-            .client
-            .queue_action(&ActionType::RegisterDex(second_dex.clone()));
-        // Queuing alone changes nothing.
-        assert!(!f.client.is_dex_registered(&second_dex));
-        assert_eq!(
-            f.client.try_execute_action(&nonce).unwrap_err().unwrap(),
-            Error::TimelockNotReady
-        );
-
-        set_timestamp(
-            &f.env,
-            f.env.ledger().timestamp() + PaymentRouter::SECONDS_IN_24H + 1,
-        );
-        f.client.execute_action(&nonce);
-        assert!(f.client.is_dex_registered(&second_dex));
-
-        // Revoking the registration is equally delayed.
-        let nonce = f
-            .client
-            .queue_action(&ActionType::DeregisterDex(second_dex.clone()));
-        assert!(f.client.is_dex_registered(&second_dex));
-        set_timestamp(
-            &f.env,
-            f.env.ledger().timestamp() + PaymentRouter::SECONDS_IN_24H + 1,
-        );
-        f.client.execute_action(&nonce);
-        assert!(!f.client.is_dex_registered(&second_dex));
-    }
-
-    #[test]
-    fn test_deregistering_a_dex_stops_further_swaps() {
-        let f = setup_swap_fixture(1, 1);
-        assert!(f.client.is_dex_registered(&f.dex));
-
-        f.client.deregister_dex(&f.dex);
-        assert!(!f.client.is_dex_registered(&f.dex));
-        assert_eq!(
-            f.client
-                .try_route_payment_with_swap(&f.payment(10_000, 1))
-                .unwrap_err()
-                .unwrap(),
-            Error::DexNotRegistered
-        );
-    }
-
-    #[test]
-    fn test_swap_emits_a_swap_executed_event() {
-        let f = setup_swap_fixture(1, 1);
-
-        f.client.route_payment_with_swap(&f.payment(10_000, 1));
-
-        let env = f.env.clone();
-        let events = env.events().all();
-        let mut swap_event = None;
-        for evt in events.iter() {
-            let (contract_id, topics, data) = evt.clone();
-            if contract_id != f.contract_id || topics.len() != 4 {
-                continue;
-            }
-            let topic0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
-            if topic0 == Symbol::new(&env, "swap_executed") {
-                swap_event = Some(data);
-            }
-        }
-
-        let data = swap_event.expect("swap_executed event was not emitted");
-        let (amount_in, amount_out, min_amount_out): (i128, i128, i128) =
-            data.try_into_val(&env).unwrap();
-        assert_eq!(amount_in, 10_000);
-        assert_eq!(amount_out, 10_000);
-        assert_eq!(min_amount_out, 1);
-    }
-}
-
-/// Property-based tests for fee calculation logic.
-///
-/// These tests exercise the pure arithmetic used in `process_single_payment`
-/// without touching the Soroban environment so they can run as ordinary host
-/// tests powered by proptest.
-///
-/// The invariants verified across 10,000 random inputs are:
-/// 1. **Conservation**: `fee_amount + remainder == amount`
-/// 2. **Non-negative fee**: `fee_amount >= 0`
-/// 3. **Non-negative remainder**: `remainder >= 0`
-/// 4. **Cap enforcement**: `fee_amount <= fee_cap`
-/// 5. **Fee never exceeds amount**: `fee_amount <= amount`
 #[cfg(test)]
-mod prop_tests {
-    use proptest::prelude::*;
-
-    // --- constants mirrored from the contract ---
-    const BPS_DIVISOR: i128 = 10_000;
-    /// Maximum valid fee in basis points (100% = 10 000 bps).
-    const MAX_FEE_BPS: i128 = 10_000;
-    /// Upper bound for a single payment amount (matches contract MAX_AMOUNT).
-    const MAX_AMOUNT: i128 = 1_000_000_000_000_000;
-
-    // --- pure fee calculation logic (mirrors process_single_payment) ---
-
-    /// Computes `(fee_amount, remainder)` exactly as the contract does.
-    ///
-    /// `user_volume_above_threshold` stands in for the tiered-discount check:
-    /// when `true` the effective fee is halved.
-    fn compute_fee(
-        amount: i128,
-        fee_bps: i128,
-        fee_cap: i128,
-        user_volume_above_threshold: bool,
-    ) -> (i128, i128) {
-        let effective_fee_bps = if user_volume_above_threshold {
-            fee_bps / 2
-        } else {
-            fee_bps
-        };
-
-        let mut fee_amount = (amount * effective_fee_bps) / BPS_DIVISOR;
-        if fee_amount > fee_cap {
-            fee_amount = fee_cap;
-        }
-        if fee_amount > amount {
-            fee_amount = amount;
-        }
-        let remainder = amount - fee_amount;
-        (fee_amount, remainder)
-    }
-
-    // -----------------------------------------------------------------------
-    // Strategies
-    // -----------------------------------------------------------------------
-
-    /// A valid payment amount: 1 ..= MAX_AMOUNT (positive, within contract bounds).
-    fn valid_amount() -> impl Strategy<Value = i128> {
-        1i128..=MAX_AMOUNT
-    }
-
-    /// A valid fee in basis points: 0 ..= 10 000 (0% to 100%).
-    fn valid_fee_bps() -> impl Strategy<Value = i128> {
-        0i128..=MAX_FEE_BPS
-    }
-
-    /// A valid fee cap: 0 ..= MAX_AMOUNT.
-    fn valid_fee_cap() -> impl Strategy<Value = i128> {
-        0i128..=MAX_AMOUNT
-    }
-
-    // -----------------------------------------------------------------------
-    // Property: fee_amount + remainder == amount  (conservation of funds)
-    // -----------------------------------------------------------------------
-
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(10_000))]
-
-        /// Funds are fully conserved: every strobe of the amount ends up either
-        /// in the treasury (fee) or the recipient (remainder), never lost or
-        /// created.
-        #[test]
-        fn prop_fee_plus_remainder_equals_amount(
-            amount in valid_amount(),
-            fee_bps in valid_fee_bps(),
-            fee_cap in valid_fee_cap(),
-            above_threshold in any::<bool>(),
-        ) {
-            let (fee_amount, remainder) = compute_fee(amount, fee_bps, fee_cap, above_threshold);
-            prop_assert_eq!(
-                fee_amount + remainder,
-                amount,
-                "fee_amount ({}) + remainder ({}) != amount ({})",
-                fee_amount, remainder, amount
-            );
-        }
-
-        /// The fee is always non-negative — the treasury never receives a
-        /// negative transfer.
-        #[test]
-        fn prop_fee_amount_is_non_negative(
-            amount in valid_amount(),
-            fee_bps in valid_fee_bps(),
-            fee_cap in valid_fee_cap(),
-            above_threshold in any::<bool>(),
-        ) {
-            let (fee_amount, _) = compute_fee(amount, fee_bps, fee_cap, above_threshold);
-            prop_assert!(
-                fee_amount >= 0,
-                "fee_amount ({}) must be >= 0",
-                fee_amount
-            );
-        }
-
-        /// The remainder is always non-negative — the recipient never receives a
-        /// negative transfer.
-        #[test]
-        fn prop_remainder_is_non_negative(
-            amount in valid_amount(),
-            fee_bps in valid_fee_bps(),
-            fee_cap in valid_fee_cap(),
-            above_threshold in any::<bool>(),
-        ) {
-            let (_, remainder) = compute_fee(amount, fee_bps, fee_cap, above_threshold);
-            prop_assert!(
-                remainder >= 0,
-                "remainder ({}) must be >= 0",
-                remainder
-            );
-        }
-
-        /// The fee never exceeds the configured cap.
-        #[test]
-        fn prop_fee_respects_cap(
-            amount in valid_amount(),
-            fee_bps in valid_fee_bps(),
-            fee_cap in valid_fee_cap(),
-            above_threshold in any::<bool>(),
-        ) {
-            let (fee_amount, _) = compute_fee(amount, fee_bps, fee_cap, above_threshold);
-            prop_assert!(
-                fee_amount <= fee_cap,
-                "fee_amount ({}) exceeds fee_cap ({})",
-                fee_amount, fee_cap
-            );
-        }
-
-        /// The fee never exceeds the payment amount itself — the sender cannot
-        /// be charged more than they are sending.
-        #[test]
-        fn prop_fee_never_exceeds_amount(
-            amount in valid_amount(),
-            fee_bps in valid_fee_bps(),
-            fee_cap in valid_fee_cap(),
-            above_threshold in any::<bool>(),
-        ) {
-            let (fee_amount, _) = compute_fee(amount, fee_bps, fee_cap, above_threshold);
-            prop_assert!(
-                fee_amount <= amount,
-                "fee_amount ({}) exceeds amount ({})",
-                fee_amount, amount
-            );
-        }
-
-        /// When the fee rate is zero the entire amount flows to the recipient.
-        #[test]
-        fn prop_zero_fee_bps_means_no_fee(
-            amount in valid_amount(),
-            fee_cap in valid_fee_cap(),
-            above_threshold in any::<bool>(),
-        ) {
-            let (fee_amount, remainder) = compute_fee(amount, 0, fee_cap, above_threshold);
-            prop_assert_eq!(fee_amount, 0, "fee_amount must be 0 when fee_bps is 0");
-            prop_assert_eq!(remainder, amount, "remainder must equal amount when fee_bps is 0");
-        }
-
-        /// When the fee cap is zero no fee is ever collected regardless of the
-        /// rate.
-        #[test]
-        fn prop_zero_fee_cap_means_no_fee(
-            amount in valid_amount(),
-            fee_bps in valid_fee_bps(),
-            above_threshold in any::<bool>(),
-        ) {
-            let (fee_amount, remainder) = compute_fee(amount, fee_bps, 0, above_threshold);
-            prop_assert_eq!(fee_amount, 0, "fee_amount must be 0 when fee_cap is 0");
-            prop_assert_eq!(remainder, amount, "remainder must equal amount when fee_cap is 0");
-        }
-
-        /// The tiered discount never produces a *higher* fee than the standard
-        /// rate: halving the bps can only leave the fee equal or reduce it.
-        #[test]
-        fn prop_tiered_discount_never_increases_fee(
-            amount in valid_amount(),
-            fee_bps in valid_fee_bps(),
-            fee_cap in valid_fee_cap(),
-        ) {
-            let (fee_full, _) = compute_fee(amount, fee_bps, fee_cap, false);
-            let (fee_discounted, _) = compute_fee(amount, fee_bps, fee_cap, true);
-            prop_assert!(
-                fee_discounted <= fee_full,
-                "discounted fee ({}) must be <= full fee ({})",
-                fee_discounted, fee_full
-            );
-        }
-    }
-}
+mod prop_tests;
